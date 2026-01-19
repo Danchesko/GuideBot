@@ -9,8 +9,6 @@ authors = [
 ]
 
 dependencies = [
-    "requests>=2.31.0",
-    "beautifulsoup4>=4.12.0",
     "tqdm>=4.66.0",
     "httpx>=0.28.1",
     "undetected-chromedriver>=3.5.5",

@@ -37,7 +37,8 @@ def init_database(db_path):
             scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             reviews_fetched_at TIMESTAMP,
             reviews_fetch_error TEXT,
-            reviews_fetch_attempts INTEGER DEFAULT 0
+            reviews_fetch_attempts INTEGER DEFAULT 0,
+            latest_review_date TIMESTAMP
         )
     """)
 
@@ -47,6 +48,7 @@ def init_database(db_path):
             -- Core review data
             id TEXT PRIMARY KEY,
             restaurant_id TEXT NOT NULL,
+            restaurant_name TEXT,
             rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5),
             text TEXT,
             date_created TIMESTAMP NOT NULL,
