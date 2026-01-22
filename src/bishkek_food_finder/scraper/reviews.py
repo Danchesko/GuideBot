@@ -153,8 +153,8 @@ async def fetch_all_reviews_for_restaurant(client, restaurant_id, restaurant_nam
     return all_new_reviews
 
 
-async def process_restaurant(client, db, restaurant_id, restaurant_name, latest_review_date, semaphore):
-    """Process one restaurant: fetch reviews, save to DB, update metadata.
+async def process_restaurant(client, db, restaurant_id, restaurant_name, latest_review_date, semaphore, stats_only=False):
+    """Process one restaurant: fetch reviews, optionally save to DB, return stats.
 
     Args:
         client: httpx.AsyncClient instance
@@ -163,6 +163,10 @@ async def process_restaurant(client, db, restaurant_id, restaurant_name, latest_
         restaurant_name: Restaurant name
         latest_review_date: ISO timestamp of newest review we have (or None)
         semaphore: asyncio.Semaphore for concurrency control
+        stats_only: If True, fetch but don't save to database
+
+    Returns:
+        dict: {'new_reviews': int, 'had_new': bool, 'error': bool (optional)}
     """
     logger = logging.getLogger(__name__)
 
@@ -173,82 +177,114 @@ async def process_restaurant(client, db, restaurant_id, restaurant_name, latest_
                 client, restaurant_id, restaurant_name, latest_review_date
             )
 
-            # If no new reviews and we already had some, just update timestamp
+            # If no new reviews and we already had some
             if len(reviews) == 0 and latest_review_date:
+                if not stats_only:
+                    db.execute("""
+                        UPDATE restaurants
+                        SET reviews_fetched_at = CURRENT_TIMESTAMP,
+                            reviews_fetch_error = NULL
+                        WHERE id = ?
+                    """, (restaurant_id,))
+                    db.commit()
+                logger.info(f"{restaurant_name}: ✓ No new reviews (up to date)")
+                return {'new_reviews': 0, 'had_new': False}
+
+            # Only save to DB if not stats_only
+            if not stats_only:
+                # Batch save all reviews
+                for r in reviews:
+                    db.execute("""
+                        INSERT OR REPLACE INTO reviews
+                        (id, restaurant_id, restaurant_name, rating, text, date_created, date_edited,
+                         likes_count, comments_count, photos_count,
+                         user_public_id, user_name, user_reviews_count,
+                         is_verified, is_hidden, has_official_answer)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        r['id'], r['restaurant_id'], r['restaurant_name'], r['rating'], r['text'],
+                        r['date_created'], r['date_edited'],
+                        r['likes_count'], r['comments_count'], r['photos_count'],
+                        r['user_public_id'], r['user_name'], r['user_reviews_count'],
+                        r['is_verified'], r['is_hidden'], r['has_official_answer']
+                    ))
+
+                # Calculate latest review date from saved reviews
+                if reviews:
+                    max_date = max(r['date_created'] for r in reviews)
+                else:
+                    max_date = None
+
+                # Mark success and update latest_review_date
                 db.execute("""
                     UPDATE restaurants
                     SET reviews_fetched_at = CURRENT_TIMESTAMP,
-                        reviews_fetch_error = NULL
+                        reviews_fetch_error = NULL,
+                        latest_review_date = ?
                     WHERE id = ?
-                """, (restaurant_id,))
+                """, (max_date if max_date else None, restaurant_id))
                 db.commit()
-                logger.info(f"{restaurant_name}: ✓ No new reviews (up to date)")
-                return
 
-            # Batch save all reviews
-            for r in reviews:
-                db.execute("""
-                    INSERT OR REPLACE INTO reviews
-                    (id, restaurant_id, restaurant_name, rating, text, date_created, date_edited,
-                     likes_count, comments_count, photos_count,
-                     user_public_id, user_name, user_reviews_count,
-                     is_verified, is_hidden, has_official_answer)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    r['id'], r['restaurant_id'], r['restaurant_name'], r['rating'], r['text'],
-                    r['date_created'], r['date_edited'],
-                    r['likes_count'], r['comments_count'], r['photos_count'],
-                    r['user_public_id'], r['user_name'], r['user_reviews_count'],
-                    r['is_verified'], r['is_hidden'], r['has_official_answer']
-                ))
-
-            # Calculate latest review date from saved reviews
-            if reviews:
-                max_date = max(r['date_created'] for r in reviews)
-            else:
-                # No reviews for this restaurant at all
-                max_date = None
-
-            # Mark success and update latest_review_date
-            db.execute("""
-                UPDATE restaurants
-                SET reviews_fetched_at = CURRENT_TIMESTAMP,
-                    reviews_fetch_error = NULL,
-                    latest_review_date = ?
-                WHERE id = ?
-            """, (max_date if max_date else None, restaurant_id))
-            db.commit()
-
-            logger.info(f"{restaurant_name}: ✓ Saved {len(reviews)} reviews")
+            logger.info(f"{restaurant_name}: ✓ {'Found' if stats_only else 'Saved'} {len(reviews)} reviews")
+            return {'new_reviews': len(reviews), 'had_new': len(reviews) > 0}
 
         except Exception as e:
-            # Mark failure
-            db.execute("""
-                UPDATE restaurants
-                SET reviews_fetch_attempts = reviews_fetch_attempts + 1,
-                    reviews_fetch_error = ?
-                WHERE id = ?
-            """, (str(e), restaurant_id))
-            db.commit()
+            if not stats_only:
+                # Mark failure in DB
+                db.execute("""
+                    UPDATE restaurants
+                    SET reviews_fetch_attempts = reviews_fetch_attempts + 1,
+                        reviews_fetch_error = ?
+                    WHERE id = ?
+                """, (str(e), restaurant_id))
+                db.commit()
 
             logger.error(f"{restaurant_name}: ✗ Failed: {e}")
+            return {'new_reviews': 0, 'had_new': False, 'error': True}
 
 
 async def main_async(args, db, restaurants):
-    """Async main: process all restaurants concurrently."""
+    """Async main: process all restaurants concurrently.
+
+    Returns:
+        dict: Aggregated stats for this run
+    """
     logger = logging.getLogger(__name__)
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_RESTAURANTS)
 
+    # Stats tracking
+    stats = {
+        'processed': 0,
+        'with_new_reviews': 0,
+        'up_to_date': 0,
+        'new_reviews_total': 0,
+        'errors': 0
+    }
+
     async with httpx.AsyncClient() as client:
         tasks = [
-            process_restaurant(client, db, rest_id, name, latest_date, semaphore)
+            process_restaurant(
+                client, db, rest_id, name, latest_date, semaphore,
+                stats_only=args.stats_only
+            )
             for rest_id, name, latest_date in restaurants
         ]
 
-        # Run with progress bar
+        # Run with progress bar and collect results
         for coro in tqdm.as_completed(tasks, total=len(tasks), desc="Scraping reviews"):
-            await coro
+            result = await coro
+            if result:
+                stats['processed'] += 1
+                if result.get('error'):
+                    stats['errors'] += 1
+                elif result.get('had_new'):
+                    stats['with_new_reviews'] += 1
+                    stats['new_reviews_total'] += result['new_reviews']
+                else:
+                    stats['up_to_date'] += 1
+
+    return stats
 
 
 def main():
@@ -280,6 +316,11 @@ def main():
         default=30,
         help="Re-check restaurants not updated in N days (default: 30)"
     )
+    parser.add_argument(
+        '--stats-only',
+        action='store_true',
+        help="Fetch and show stats without saving to database"
+    )
     args = parser.parse_args()
 
     # Setup logging
@@ -287,7 +328,7 @@ def main():
 
     # Print to console (not logged)
     print(f"\n{'='*60}")
-    print(f"Starting reviews scraper (dry_run={args.dry_run})")
+    print(f"Starting reviews scraper (stats_only={args.stats_only})")
     print(f"{'='*60}\n")
 
     # Initialize database
@@ -330,26 +371,28 @@ def main():
 
     # Run async scraping
     start_time = datetime.now()
-    asyncio.run(main_async(args, db, restaurants))
+    stats = asyncio.run(main_async(args, db, restaurants))
     elapsed = (datetime.now() - start_time).total_seconds()
 
-    # Summary
-    cursor = db.execute("""
-        SELECT
-            COUNT(*) as total_restaurants,
-            SUM(CASE WHEN reviews_fetched_at IS NOT NULL THEN 1 ELSE 0 END) as fetched,
-            SUM(CASE WHEN reviews_fetch_error IS NOT NULL THEN 1 ELSE 0 END) as errors
-        FROM restaurants
-    """)
-    total, fetched, errors = cursor.fetchone()
-
+    # Get DB total
     cursor = db.execute("SELECT COUNT(*) FROM reviews")
     total_reviews = cursor.fetchone()[0]
 
+    # Summary
     print(f"\n{'='*60}")
     print(f"Scraping complete in {elapsed:.1f}s!")
-    print(f"Restaurants: {fetched}/{total} fetched, {errors} errors")
-    print(f"Total reviews: {total_reviews}")
+    print()
+    print(f"This run:")
+    print(f"  Restaurants processed: {stats['processed']}")
+    print(f"  With new reviews: {stats['with_new_reviews']}")
+    print(f"  Already up-to-date: {stats['up_to_date']}")
+    print(f"  New reviews fetched: {stats['new_reviews_total']}")
+    print(f"  Errors: {stats['errors']}")
+    print()
+    if args.stats_only:
+        print(f"Database total: {total_reviews} reviews (unchanged - stats_only mode)")
+    else:
+        print(f"Database total: {total_reviews} reviews")
     print(f"{'='*60}\n")
 
     db.close()
