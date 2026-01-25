@@ -18,6 +18,7 @@ dependencies = [
     "chromadb>=1.4.1",
     "anthropic>=0.76.0",
     "python-dotenv>=1.2.1",
+    "python-telegram-bot>=22.6",
 ]
 
 [build-system]
