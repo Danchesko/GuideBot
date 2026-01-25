@@ -3,7 +3,7 @@ name = "bishkek-food-finder"
 version = "0.1.0"
 description = "Telegram bot for finding restaurants in Bishkek with fake review detection"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 authors = [
     { name = "Danny", email = "danberdov@gmail.com" }
 ]
@@ -13,6 +13,11 @@ dependencies = [
     "httpx>=0.28.1",
     "undetected-chromedriver>=3.5.5",
     "selenium>=4.36.0",
+    "reportlab>=4.4.9",
+    "sentence-transformers>=5.2.0",
+    "chromadb>=1.4.1",
+    "anthropic>=0.76.0",
+    "python-dotenv>=1.2.1",
 ]
 
 [build-system]
