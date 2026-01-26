@@ -5,15 +5,17 @@ Creates two tables:
 - restaurant_stats: per-restaurant aggregates (weighted_rating, confidence_score)
 
 Run: uv run python -m bishkek_food_finder.indexer.trust
+     uv run python -m bishkek_food_finder.indexer.trust --city almaty
 """
 
+import argparse
 import sqlite3
 import re
 from math import log
 from datetime import datetime
 from collections import defaultdict
 
-DB_PATH = "data/bishkek.db"
+from bishkek_food_finder.scraper.config import CITIES, get_city_config
 
 # === TRUST CONFIG ===
 
@@ -156,7 +158,25 @@ def compute_restaurant_stats(conn, global_avg: float) -> list[tuple]:
 # === MAIN ===
 
 def main():
-    conn = sqlite3.connect(DB_PATH)
+    parser = argparse.ArgumentParser(description="Compute trust scores and restaurant stats")
+    parser.add_argument(
+        '--city',
+        default='bishkek',
+        choices=list(CITIES.keys()),
+        help="City to process (default: bishkek)"
+    )
+    parser.add_argument(
+        '--test',
+        action='store_true',
+        help="Use test database (data/{city}_test.db)"
+    )
+    args = parser.parse_args()
+
+    city_config = get_city_config(args.city, test=args.test)
+    print(f"Processing {city_config['name']}...")
+    print(f"Database: {city_config['db_path']}\n")
+
+    conn = sqlite3.connect(city_config['db_path'])
     conn.row_factory = sqlite3.Row
 
     # === PHASE 1: Review Trust ===

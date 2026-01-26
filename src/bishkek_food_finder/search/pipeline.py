@@ -3,6 +3,7 @@
 Handles semantic search, geo filtering, trust-weighted scoring.
 
 Run: uv run python -m bishkek_food_finder.search.pipeline "уютное место"
+     uv run python -m bishkek_food_finder.search.pipeline "вкусный плов" --city almaty
 """
 
 import argparse
@@ -15,8 +16,8 @@ from math import radians, sin, cos, sqrt, atan2
 from sentence_transformers import SentenceTransformer
 import chromadb
 
-DB_PATH = "data/bishkek.db"
-CHROMA_PATH = "data/chroma"
+from bishkek_food_finder.scraper.config import CITIES, get_city_config
+
 COLLECTION_NAME = "reviews"
 MODEL_NAME = "cointegrated/rubert-tiny2"
 
@@ -28,7 +29,7 @@ MIN_SIMILARITY = 0.7
 # === LAZY LOADING ===
 
 _model = None
-_collection = None
+_collections = {}  # city -> collection
 
 
 def get_model():
@@ -38,12 +39,13 @@ def get_model():
     return _model
 
 
-def get_collection():
-    global _collection
-    if _collection is None:
-        client = chromadb.PersistentClient(path=CHROMA_PATH)
-        _collection = client.get_collection(COLLECTION_NAME)
-    return _collection
+def get_collection(city: str = "bishkek"):
+    global _collections
+    if city not in _collections:
+        city_config = get_city_config(city)
+        client = chromadb.PersistentClient(path=city_config['chroma_path'])
+        _collections[city] = client.get_collection(COLLECTION_NAME)
+    return _collections[city]
 
 
 # === GEO HELPERS ===
@@ -145,12 +147,13 @@ def get_filtered_restaurants(
 
 def search_chroma(
     query: str,
+    city: str = "bishkek",
     n_results: int = 500,
     restaurant_ids: set = None,
 ) -> list[dict]:
     """Search Chroma for similar reviews."""
     model = get_model()
-    collection = get_collection()
+    collection = get_collection(city)
 
     query_embedding = model.encode(query).tolist()
 
@@ -236,8 +239,11 @@ def score_reviews(conn, chroma_results: list[dict]) -> list[dict]:
     return scored
 
 
-def aggregate_by_restaurant(scored_reviews: list[dict]) -> list[dict]:
+def aggregate_by_restaurant(scored_reviews: list[dict], city: str = "bishkek") -> list[dict]:
     """Group by restaurant, sum scores, collect reviews."""
+    city_config = get_city_config(city)
+    link_template = city_config['link_template']
+
     by_restaurant = defaultdict(lambda: {
         "score": 0.0,
         "reviews": [],
@@ -259,7 +265,7 @@ def aggregate_by_restaurant(scored_reviews: list[dict]) -> list[dict]:
                 "restaurant_id": rest_id,
                 "name": r["name"],
                 "address": r["address"],
-                "link": f"https://2gis.kg/bishkek/firm/{rest_id}",
+                "link": link_template.format(id=rest_id),
                 "rating_2gis": r["rating_2gis"],
                 "rating_trusted": r["rating_trusted"],
                 "trusted_review_count": r["trusted_review_count"],
@@ -323,6 +329,7 @@ def apply_geo_decay(
 
 def search(
     query: str,
+    city: str = "bishkek",
     location: tuple = None,
     radius_km: float = None,
     price_max: int = None,
@@ -331,7 +338,8 @@ def search(
     top_k: int = 10,
 ) -> list[dict]:
     """Main search pipeline."""
-    conn = sqlite3.connect(DB_PATH)
+    city_config = get_city_config(city)
+    conn = sqlite3.connect(city_config['db_path'])
     conn.row_factory = sqlite3.Row
 
     # 1. Get filtered restaurant IDs
@@ -344,13 +352,13 @@ def search(
     )
 
     # 2. Chroma search
-    chroma_results = search_chroma(query, n_reviews, restaurant_ids)
+    chroma_results = search_chroma(query, city=city, n_results=n_reviews, restaurant_ids=restaurant_ids)
 
     # 3. Score reviews
     scored = score_reviews(conn, chroma_results)
 
     # 4. Aggregate by restaurant
-    restaurants = aggregate_by_restaurant(scored)
+    restaurants = aggregate_by_restaurant(scored, city=city)
 
     # 5. Apply geo decay
     if location:
@@ -361,9 +369,66 @@ def search(
     return restaurants[:top_k]
 
 
+# === TRANSLITERATION ===
+
+# Cyrillic ↔ Latin lookalikes (visually similar characters)
+CYRILLIC_TO_LATIN = {
+    'А': 'A', 'а': 'a',
+    'В': 'B', 'в': 'b',  # В looks like B
+    'Е': 'E', 'е': 'e',
+    'К': 'K', 'к': 'k',
+    'М': 'M', 'м': 'm',
+    'Н': 'H', 'н': 'h',  # Н looks like H
+    'О': 'O', 'о': 'o',
+    'Р': 'P', 'р': 'p',  # Р looks like P
+    'С': 'C', 'с': 'c',
+    'Т': 'T', 'т': 't',
+    'У': 'Y', 'у': 'y',  # У looks like Y
+    'Х': 'X', 'х': 'x',
+}
+
+# Full Cyrillic → Latin transliteration for phonetic matching
+CYRILLIC_TRANSLIT = {
+    'А': 'A', 'а': 'a', 'Б': 'B', 'б': 'b', 'В': 'V', 'в': 'v',
+    'Г': 'G', 'г': 'g', 'Д': 'D', 'д': 'd', 'Е': 'E', 'е': 'e',
+    'Ё': 'E', 'ё': 'e', 'Ж': 'Zh', 'ж': 'zh', 'З': 'Z', 'з': 'z',
+    'И': 'I', 'и': 'i', 'Й': 'Y', 'й': 'y', 'К': 'K', 'к': 'k',
+    'Л': 'L', 'л': 'l', 'М': 'M', 'м': 'm', 'Н': 'N', 'н': 'n',
+    'О': 'O', 'о': 'o', 'П': 'P', 'п': 'p', 'Р': 'R', 'р': 'r',
+    'С': 'S', 'с': 's', 'Т': 'T', 'т': 't', 'У': 'U', 'у': 'u',
+    'Ф': 'F', 'ф': 'f', 'Х': 'Kh', 'х': 'kh', 'Ц': 'Ts', 'ц': 'ts',
+    'Ч': 'Ch', 'ч': 'ch', 'Ш': 'Sh', 'ш': 'sh', 'Щ': 'Shch', 'щ': 'shch',
+    'Ъ': '', 'ъ': '', 'Ы': 'Y', 'ы': 'y', 'Ь': '', 'ь': '',
+    'Э': 'E', 'э': 'e', 'Ю': 'Yu', 'ю': 'yu', 'Я': 'Ya', 'я': 'ya',
+}
+
+LATIN_TO_CYRILLIC = {v: k for k, v in CYRILLIC_TO_LATIN.items()}
+
+
+def transliterate_to_latin(text: str) -> str:
+    """Transliterate Cyrillic text to Latin (phonetic)."""
+    return ''.join(CYRILLIC_TRANSLIT.get(c, c) for c in text)
+
+
+def get_search_variants(name: str) -> list[str]:
+    """Generate search variants for a name (original + transliterated)."""
+    variants = [name]
+
+    # Try Cyrillic → Latin transliteration
+    latin = transliterate_to_latin(name)
+    if latin != name:
+        variants.append(latin)
+
+    # Capitalize first letter variants
+    variants = [v[0].upper() + v[1:] if v else v for v in variants]
+
+    return list(set(variants))
+
+
 # === RESTAURANT LOOKUP ===
 
 def get_restaurant_details(
+    city: str = "bishkek",
     name: str = None,
     id: str = None,
     address_hint: str = None,
@@ -371,7 +436,8 @@ def get_restaurant_details(
     min_trust: float = 0.3,
 ) -> dict:
     """Look up restaurant by name, ID, or name+address."""
-    conn = sqlite3.connect(DB_PATH)
+    city_config = get_city_config(city)
+    conn = sqlite3.connect(city_config['db_path'])
     conn.row_factory = sqlite3.Row
 
     # Priority 1: Exact ID lookup
@@ -380,27 +446,55 @@ def get_restaurant_details(
             "SELECT * FROM restaurants WHERE id = ?", (id,)
         ).fetchall()
     # Priority 2: Name + optional address hint
-    # Note: LIKE is case-sensitive for Cyrillic in SQLite, so we capitalize first letter
+    # Generate search variants (original + transliterated) to handle Latin/Cyrillic mismatches
     elif name:
-        # Capitalize first letter to match DB naming convention
-        name_cap = name[0].upper() + name[1:] if name else name
+        name_variants = get_search_variants(name)
+
         if address_hint:
             address_cap = address_hint[0].upper() + address_hint[1:] if address_hint else address_hint
-            restaurants = conn.execute("""
+            # Build OR query for all name variants
+            placeholders = " OR ".join(["name LIKE ?" for _ in name_variants])
+            params = [f"%{v}%" for v in name_variants] + [f"%{address_cap}%"]
+            restaurants = conn.execute(f"""
                 SELECT * FROM restaurants
-                WHERE name LIKE ?
+                WHERE ({placeholders})
                   AND address LIKE ?
-            """, (f"%{name_cap}%", f"%{address_cap}%")).fetchall()
+            """, params).fetchall()
         else:
-            restaurants = conn.execute("""
+            placeholders = " OR ".join(["name LIKE ?" for _ in name_variants])
+            params = [f"%{v}%" for v in name_variants]
+            restaurants = conn.execute(f"""
                 SELECT * FROM restaurants
-                WHERE name LIKE ?
-            """, (f"%{name_cap}%",)).fetchall()
+                WHERE {placeholders}
+            """, params).fetchall()
     else:
         conn.close()
         return {"found": False, "message": "Provide name or id"}
 
     if not restaurants:
+        # If address_hint was provided but no match, try without address to show alternatives
+        if address_hint and name:
+            name_variants = get_search_variants(name)
+            placeholders = " OR ".join(["name LIKE ?" for _ in name_variants])
+            params = [f"%{v}%" for v in name_variants]
+            alternatives = conn.execute(f"""
+                SELECT id, name, address FROM restaurants
+                WHERE {placeholders}
+            """, params).fetchall()
+
+            if alternatives:
+                conn.close()
+                return {
+                    "found": False,
+                    "address_not_found": True,
+                    "searched_address": address_hint,
+                    "alternatives": [
+                        {"id": r["id"], "name": r["name"], "address": r["address"]}
+                        for r in alternatives
+                    ],
+                    "message": f"No '{name}' at '{address_hint}', but found {len(alternatives)} other locations. Show them to user with numbers (1, 2, 3...) so they can pick one. When user picks, use get_restaurant with that ID."
+                }
+
         conn.close()
         search_term = id or f"{name} {address_hint or ''}".strip()
         return {
@@ -408,54 +502,67 @@ def get_restaurant_details(
             "message": f"Restaurant '{search_term}' not found in database. Ask user to send their location or name a known restaurant nearby."
         }
 
-    # Build full details for ALL matching restaurants
-    results = []
-    for restaurant in restaurants:
-        restaurant = dict(restaurant)
+    # Multiple matches by name → return lightweight list, ask user to pick
+    # Single match OR lookup by ID → return full details
+    if len(restaurants) > 1 and not id:
+        conn.close()
+        return {
+            "found": True,
+            "multiple": True,
+            "count": len(restaurants),
+            "locations": [
+                {"id": r["id"], "name": r["name"], "address": r["address"]}
+                for r in restaurants
+            ],
+            "message": f"Found {len(restaurants)} locations. Show numbered list to user and ask which one. When user picks, call get_restaurant with that ID."
+        }
 
-        # Get trusted reviews
-        reviews = conn.execute("""
-            SELECT r.text, r.rating, r.user_name,
-                   rt.base_trust * rt.burst * rt.recency as trust
-            FROM reviews r
-            JOIN review_trust rt ON r.id = rt.review_id
-            WHERE r.restaurant_id = ?
-              AND (rt.base_trust * rt.burst * rt.recency) >= ?
-            ORDER BY trust DESC
-            LIMIT ?
-        """, (restaurant["id"], min_trust, max_reviews)).fetchall()
+    # Single match or ID lookup → return full details
+    restaurant = dict(restaurants[0])
 
-        # Get stats
-        stats = conn.execute(
-            "SELECT * FROM restaurant_stats WHERE restaurant_id = ?",
-            (restaurant["id"],)
-        ).fetchone()
+    # Get trusted reviews
+    reviews = conn.execute("""
+        SELECT r.text, r.rating, r.user_name,
+               rt.base_trust * rt.burst * rt.recency as trust
+        FROM reviews r
+        JOIN review_trust rt ON r.id = rt.review_id
+        WHERE r.restaurant_id = ?
+          AND (rt.base_trust * rt.burst * rt.recency) >= ?
+        ORDER BY trust DESC
+        LIMIT ?
+    """, (restaurant["id"], min_trust, max_reviews)).fetchall()
 
-        results.append({
-            "id": restaurant["id"],
-            "name": restaurant["name"],
-            "address": restaurant["address"],
-            "lat": restaurant["lat"],
-            "lon": restaurant["lon"],
-            "rating_2gis": restaurant["rating"],
-            "rating_trusted": round(stats["weighted_rating"], 2) if stats else None,
-            "trusted_review_count": stats["trusted_review_count"] if stats else 0,
-            "category": restaurant["category"],
-            "cuisine": json.loads(restaurant["cuisine"]) if restaurant["cuisine"] else [],
-            "avg_price_som": restaurant["avg_price_som"],
-            "link": f"https://2gis.kg/bishkek/firm/{restaurant['id']}",
-            "reviews": [
-                {"text": r["text"][:500], "rating": r["rating"], "trust": round(r["trust"], 2)}
-                for r in reviews
-            ]
-        })
+    # Get stats
+    stats = conn.execute(
+        "SELECT * FROM restaurant_stats WHERE restaurant_id = ?",
+        (restaurant["id"],)
+    ).fetchone()
+
+    result = {
+        "id": restaurant["id"],
+        "name": restaurant["name"],
+        "address": restaurant["address"],
+        "lat": restaurant["lat"],
+        "lon": restaurant["lon"],
+        "rating_2gis": restaurant["rating"],
+        "rating_trusted": round(stats["weighted_rating"], 2) if stats else None,
+        "trusted_review_count": stats["trusted_review_count"] if stats else 0,
+        "category": restaurant["category"],
+        "cuisine": json.loads(restaurant["cuisine"]) if restaurant["cuisine"] else [],
+        "avg_price_som": restaurant["avg_price_som"],
+        "link": city_config['link_template'].format(id=restaurant['id']),
+        "reviews": [
+            {"text": r["text"][:500], "rating": r["rating"], "trust": round(r["trust"], 2)}
+            for r in reviews
+        ]
+    }
 
     conn.close()
 
     return {
         "found": True,
-        "count": len(results),
-        "restaurants": results
+        "count": 1,
+        "restaurant": result
     }
 
 
@@ -491,6 +598,7 @@ def print_results(results: list[dict], json_output: bool = False):
 def main():
     parser = argparse.ArgumentParser(description="Search restaurants")
     parser.add_argument("query", help="Search query")
+    parser.add_argument("--city", default="bishkek", choices=list(CITIES.keys()), help="City to search")
     parser.add_argument("--top", type=int, default=10, help="Number of results")
     parser.add_argument("--lat", type=float, help="Latitude")
     parser.add_argument("--lon", type=float, help="Longitude")
@@ -500,10 +608,14 @@ def main():
     parser.add_argument("--json", action="store_true", help="JSON output")
     args = parser.parse_args()
 
+    city_config = get_city_config(args.city)
+    print(f"Searching in {city_config['name']}...\n")
+
     location = (args.lat, args.lon) if args.lat and args.lon else None
 
     results = search(
         query=args.query,
+        city=args.city,
         location=location,
         radius_km=args.radius,
         price_max=args.price_max,

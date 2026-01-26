@@ -16,6 +16,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 from bishkek_food_finder.agent import run as agent_run
+from bishkek_food_finder.scraper.config import CITIES, get_city_config
 
 load_dotenv()
 
@@ -23,6 +24,26 @@ load_dotenv()
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_USERS = [u.strip() for u in os.environ.get("ALLOWED_USERS", "").split(",") if u.strip()]
+
+# City selection keyboard
+CITY_KEYBOARD = ReplyKeyboardMarkup([
+    [KeyboardButton("🇰🇬 Бишкек"), KeyboardButton("🇰🇿 Алматы")]
+], resize_keyboard=True, one_time_keyboard=True)
+
+# Map button text to city code
+CITY_BUTTON_MAP = {
+    "🇰🇬 Бишкек": "bishkek",
+    "🇰🇿 Алматы": "almaty",
+}
+
+
+def get_main_keyboard(city: str) -> ReplyKeyboardMarkup:
+    """Get main keyboard with location button and city change option."""
+    city_config = get_city_config(city)
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("📍 Отправить локацию", request_location=True)],
+        [KeyboardButton(f"🏙 {city_config['name']} → сменить")]
+    ], resize_keyboard=True)
 
 # === LOGGING ===
 
@@ -65,81 +86,69 @@ async def keep_typing(update: Update):
 
 # === HANDLERS ===
 
-WELCOME_MSG = """
-Привет! Я помогу найти ресторан в Бишкеке.
+CITY_SELECT_MSG = "Привет! Выбери город:"
 
-*Как это работает:*
-Анализирую 294,000 реальных отзывов и фильтрую фейковые.
+
+def get_welcome_msg(city_name: str) -> str:
+    return f"""
+*Поиск ресторанов • {city_name}*
+
+Анализирую 300K+ реальных отзывов и фильтрую фейковые.
 Ищу по смыслу, а не по ключевым словам.
 
-*Что я умею:*
-• По кухне: «хочу суши», «где плов»
-• По атмосфере: «уютное место для свидания»
-• По цене: «недорогой обед до 500 сом»
-• По расстоянию: «кафе рядом» (нужна локация)
-• О конкретном месте: «что поесть в Navat», «как тебе La Maison»
+*Что можно спросить:*
 
-*Поиск рядом:*
-📍 Отправь локацию и напиши «рядом» в запросе.
+🍽 *Поиск по блюду или кухне*
+«вкусный плов»
+«топовые самсы»
+«лучшие суши»
 
-*Команды:*
-/help — справка
-/reset — начать заново
-""".strip()
+📍 *Поиск рядом*
+Сначала отправь 📍 локацию, потом:
+«плов рядом»
+«кофейня в 5 км от меня»
 
-HELP_MSG = """
-*Бот для поиска ресторанов в Бишкеке*
+Или назови любой ресторан как ориентир:
+«суши рядом с Navat»
+«что-то рядом с Барашек»
 
-📊 294,000 отзывов • Фильтрация фейков • Умный поиск
+🔍 *Вопрос о конкретном месте*
+«что хвалят в Барашке»
+«что поесть в Мубарак»
+«как тебе Винтаж?»
 
-━━━━━━━━━━━━━━━━━━━━
+Если у заведения несколько филиалов — покажу список, ты выберешь нужный.
 
-*Что умею:*
-
-🍽 *Поиск* — «вкусный плов», «суши», «романтический ужин»
-
-💰 *По бюджету* — «недорого до 500 сом», «средний бюджет»
-
-📍 *Рядом с тобой* — отправь 📍 локацию, потом «кафе рядом»
-
-📍 *Рядом с местом* — «плов рядом с Navat» (назови любой ресторан)
-
-🔍 *О месте* — «что поесть в Navat», «как тебе Винтаж»
-
-💬 *Уточнения* — «ещё варианты», «а подешевле?»
-
-━━━━━━━━━━━━━━━━━━━━
-
-*Не поддерживается:*
-Поиск по районам («в центре», «на юге»)
-→ Отправь локацию или назови ресторан рядом
-
-━━━━━━━━━━━━━━━━━━━━
+*Что не работает:*
+Поиск по районам: «в Асанбае», «в центре», «на юге»
+→ Вместо района отправь 📍 локацию или назови ресторан рядом
 
 *Команды:*
-/reset — очистить историю
+/reset — начать новый диалог
 /json — скачать результаты поиска
 
-*Рейтинг (real)* = без накрученных отзывов
+⭐️ Рейтинг *(real)* = очищен от накруток
 """.strip()
+
+
+def get_help_msg(city_name: str) -> str:
+    return get_welcome_msg(city_name)
 
 
 @authorized
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start - welcome message and reset state."""
+    """Handle /start - show city selection."""
     context.user_data.clear()
-    keyboard = ReplyKeyboardMarkup(
-        [[KeyboardButton("📍 Отправить локацию", request_location=True)]],
-        resize_keyboard=True
-    )
-    await update.message.reply_text(WELCOME_MSG, parse_mode="Markdown", reply_markup=keyboard)
+    await update.message.reply_text(CITY_SELECT_MSG, reply_markup=CITY_KEYBOARD)
     logger.info(f"START: user={update.effective_user.id}")
 
 
 @authorized
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help - show detailed instructions."""
-    await update.message.reply_text(HELP_MSG, parse_mode="Markdown")
+    city = context.user_data.get("city", "bishkek")
+    city_config = get_city_config(city)
+    await update.message.reply_text(get_help_msg(city_config['name']), parse_mode="Markdown")
     logger.info(f"HELP: user={update.effective_user.id}")
 
 
@@ -174,7 +183,11 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle location - store for geo-filtered searches."""
     loc = update.message.location
     context.user_data["location"] = (loc.latitude, loc.longitude)
-    await update.message.reply_text(f"📍 Запомнил! ({loc.latitude:.4f}, {loc.longitude:.4f})")
+    city = context.user_data.get("city", "bishkek")
+    await update.message.reply_text(
+        f"📍 Запомнил! ({loc.latitude:.4f}, {loc.longitude:.4f})",
+        reply_markup=get_main_keyboard(city)
+    )
     logger.info(f"LOCATION: user={update.effective_user.id} lat={loc.latitude} lon={loc.longitude}")
 
 
@@ -187,6 +200,32 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     logger.info(f"MESSAGE: user={update.effective_user.id} text={text[:50]}...")
 
+    # Handle city selection buttons
+    if text in CITY_BUTTON_MAP:
+        city = CITY_BUTTON_MAP[text]
+        user["city"] = city
+        user["history"] = []  # Reset history when changing city
+        city_config = get_city_config(city)
+        await update.message.reply_text(
+            get_welcome_msg(city_config['name']),
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard(city)
+        )
+        logger.info(f"CITY_SELECT: user={update.effective_user.id} city={city}")
+        return
+
+    # Handle city change button
+    if "→ сменить" in text:
+        await update.message.reply_text("Выбери новый город:", reply_markup=CITY_KEYBOARD)
+        logger.info(f"CITY_CHANGE: user={update.effective_user.id}")
+        return
+
+    # Check if city is selected
+    city = user.get("city")
+    if not city:
+        await update.message.reply_text("Сначала выбери город:", reply_markup=CITY_KEYBOARD)
+        return
+
     # Build message with location context
     if user.get("location"):
         lat, lon = user["location"]
@@ -198,7 +237,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     typing_task = asyncio.create_task(keep_typing(update))
     try:
         response, user["history"], last_results = await asyncio.to_thread(
-            agent_run, message, user.get("history", [])
+            agent_run, message, user.get("history", []), city
         )
         if last_results:
             user["last_results"] = last_results
@@ -211,7 +250,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         typing_task.cancel()
 
     await send_response(update, response)
-    logger.info(f"RESPONSE: user={update.effective_user.id} len={len(response)}")
+    logger.info(f"RESPONSE: user={update.effective_user.id} city={city} len={len(response)}")
 
 
 # === MAIN ===

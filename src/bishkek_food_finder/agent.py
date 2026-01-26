@@ -16,6 +16,7 @@ from anthropic import Anthropic
 load_dotenv()
 
 from bishkek_food_finder.search.pipeline import search, get_restaurant_details
+from bishkek_food_finder.scraper.config import CITIES, get_city_config
 
 # === CONFIG ===
 
@@ -63,13 +64,14 @@ def compress_results(results: list[dict]) -> list[dict]:
     } for r in results[:MAX_RESTAURANTS]]
 
 
-def execute_search(params: dict) -> dict:
+def execute_search(params: dict, city: str = "bishkek") -> dict:
     """Execute search pipeline and return compressed results."""
     try:
         location = (params["latitude"], params["longitude"]) if params.get("latitude") else None
 
         results = search(
             query=params["query"],
+            city=city,
             location=location,
             radius_km=params.get("radius_km"),
             price_max=params.get("price_max"),
@@ -87,18 +89,24 @@ def execute_search(params: dict) -> dict:
 
 # === AGENT LOOP ===
 
-def run(message: str, history: list = None) -> tuple[str, list, dict | None]:
+def run(message: str, history: list = None, city: str = "bishkek") -> tuple[str, list, dict | None]:
     """Run agent. Returns (response, updated_history, last_search_results)."""
+    city_config = get_city_config(city)
+    city_name = city_config['name']
+
+    # Build city-specific system prompt
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(city_name=city_name)
+
     messages = list(history) if history else []
     messages.append({"role": "user", "content": message})
-    logger.info(f"USER: {message}")
+    logger.info(f"USER ({city}): {message}")
     last_results = None
 
     for _ in range(MAX_ITERATIONS):
         response = client.messages.create(
             model=MODEL,
             max_tokens=4096,
-            system=SYSTEM_PROMPT,
+            system=system_prompt,
             tools=TOOLS,
             messages=messages
         )
@@ -120,9 +128,10 @@ def run(message: str, history: list = None) -> tuple[str, list, dict | None]:
                     logger.info(f"TOOL: {block.name}({json.dumps(block.input, ensure_ascii=False)})")
 
                     if block.name == "search_restaurants":
-                        result = execute_search(block.input)
+                        result = execute_search(block.input, city=city)
                     elif block.name == "get_restaurant":
                         result = get_restaurant_details(
+                            city=city,
                             name=block.input.get("name"),
                             id=block.input.get("id"),
                             address_hint=block.input.get("address_hint"),
@@ -151,11 +160,14 @@ def main():
     """Interactive CLI or single query."""
     parser = argparse.ArgumentParser(description="Restaurant recommendation agent")
     parser.add_argument("query", nargs="?", help="Single query")
+    parser.add_argument("--city", default="bishkek", choices=list(CITIES.keys()), help="City to search")
     parser.add_argument("--interactive", "-i", action="store_true", help="Interactive mode")
     args = parser.parse_args()
 
+    city_config = get_city_config(args.city)
+
     if args.interactive:
-        print("Бот для поиска ресторанов в Бишкеке\nВведите /exit для выхода\n")
+        print(f"Бот для поиска ресторанов в городе {city_config['name']}\nВведите /exit для выхода\n")
         history = []
         while True:
             try:
@@ -164,16 +176,16 @@ def main():
                 break
             if not user or user == "/exit":
                 break
-            response, history, _ = run(user, history)
+            response, history, _ = run(user, history, city=args.city)
             print(f"\nБот: {response}\n")
     else:
-        response, _, _ = run(args.query or "Где вкусный плов?")
+        response, _, _ = run(args.query or "Где вкусный плов?", city=args.city)
         print(response)
 
 
 # === SYSTEM PROMPT ===
 
-SYSTEM_PROMPT = """Ты — бот для поиска ресторанов в Бишкеке.
+SYSTEM_PROMPT_TEMPLATE = """Ты — бот для поиска ресторанов в городе {city_name}.
 
 ## Возможности
 - Поиск по кухне, атмосфере, блюдам, цене, локации
@@ -183,10 +195,13 @@ SYSTEM_PROMPT = """Ты — бот для поиска ресторанов в �
 ## Как искать
 1. Используй search_restaurants для поиска ресторанов по критериям
 2. Используй get_restaurant для вопросов о КОНКРЕТНОМ месте:
-   - "что поесть в Навват" → get_restaurant("Навват")
-   - "как тебе Винтаж?" → get_restaurant("Винтаж")
-   - "рядом с La Maison" → get_restaurant("La Maison") → использовать lat/lon для search_restaurants
-3. get_restaurant возвращает ВСЕ филиалы с полной информацией — если несколько локаций, покажи все или спроси какая ближе к user
+   - "что поесть в Навват" → get_restaurant(name="Навват")
+   - "как тебе Винтаж?" → get_restaurant(name="Винтаж")
+   - "рядом с La Maison" → get_restaurant(name="La Maison") → использовать lat/lon для search_restaurants
+3. get_restaurant возвращает:
+   - Если ОДИН филиал → полная информация с отзывами
+   - Если НЕСКОЛЬКО филиалов → список адресов с ID, покажи пользователю с номерами (1, 2, 3...)
+   - Когда user выбирает ("второй", "на Киевской") → вызови get_restaurant(id=...) с нужным ID
 4. Формулируй query конкретно на русском
 5. Используй radius_km когда user упоминает локацию:
    - "рядом", "близко" → 1
@@ -237,11 +252,11 @@ SYSTEM_PROMPT = """Ты — бот для поиска ресторанов в �
 
 ```
 🔍 Ищу: недооцененное место изысканная кухня
-📍 Радиус: весь Бишкек
+📍 Радиус: весь город
 💰 Бюджет: любой
 ```
 
-Места с уникальной атмосферой и изысканной кухней в Бишкеке
+Места с уникальной атмосферой и изысканной кухней
 
 🥇 La Maison du voyageur ⭐️ 4.31 (real) • ~400 сом
    📍 улица Орозбекова, 19

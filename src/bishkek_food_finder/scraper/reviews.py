@@ -9,9 +9,9 @@ import httpx
 from tqdm.asyncio import tqdm
 
 from .config import (
-    setup_logging, DB_PATH, REVIEWS_API_URL, REVIEWS_API_KEY,
+    setup_logging, REVIEWS_API_URL, REVIEWS_API_KEY,
     REVIEWS_PAGE_LIMIT, MAX_CONCURRENT_RESTAURANTS, MAX_RETRIES,
-    RETRY_BACKOFF_BASE
+    RETRY_BACKOFF_BASE, CITIES, get_city_config
 )
 from .db import init_database
 
@@ -289,6 +289,17 @@ def main():
         description="Scrape reviews from 2GIS API with incremental update support"
     )
     parser.add_argument(
+        '--city',
+        default='bishkek',
+        choices=list(CITIES.keys()),
+        help="City to scrape reviews for (default: bishkek)"
+    )
+    parser.add_argument(
+        '--test',
+        action='store_true',
+        help="Use test database (data/{city}_test.db)"
+    )
+    parser.add_argument(
         '--dry-run',
         action='store_true',
         help="Test run without saving to database"
@@ -318,16 +329,19 @@ def main():
     )
     args = parser.parse_args()
 
+    # Get city configuration
+    city_config = get_city_config(args.city, test=args.test)
+
     # Setup logging
-    logger = setup_logging(script_name="reviews")
+    logger = setup_logging(script_name=f"reviews_{args.city}")
 
     # Print to console (not logged)
     print(f"\n{'='*60}")
-    print(f"Starting reviews scraper (stats_only={args.stats_only})")
+    print(f"Starting reviews scraper for {city_config['name']} (stats_only={args.stats_only})")
     print(f"{'='*60}\n")
 
     # Initialize database
-    db = init_database(DB_PATH)
+    db = init_database(city_config['db_path'])
 
     # Get restaurants that need reviews
     # Either: never fetched OR not checked in N days

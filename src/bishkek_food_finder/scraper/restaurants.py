@@ -30,7 +30,7 @@ import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
-from .config import setup_logging, SEARCH_URL, TOTAL_PAGES, DB_PATH
+from .config import setup_logging, CITIES, get_city_config
 from .db import init_database
 
 
@@ -167,7 +167,10 @@ def parse_api_items(items, logger):
 
 
 def click_next_page(driver, next_page_num, logger):
-    """Click to next page and wait for API call to complete."""
+    """Click to next page and wait for API call to complete.
+
+    Returns True if successful, False if no next page exists (end of results).
+    """
     try:
         # Clear network logs before clicking
         driver.get_log('performance')
@@ -180,17 +183,29 @@ def click_next_page(driver, next_page_num, logger):
         time.sleep(2)
 
         logger.debug(f"Clicked to page {next_page_num}")
+        return True
 
     except Exception as e:
-        logger.error(f"Failed to click to page {next_page_num}: {e}")
-        raise
+        logger.info(f"No page {next_page_num} found - likely end of results")
+        return False
 
 
 def main():
     """Main scraper entry point."""
     # Parse arguments
     parser = argparse.ArgumentParser(
-        description="Scrape restaurants from 2GIS Bishkek with API interception"
+        description="Scrape restaurants from 2GIS with API interception"
+    )
+    parser.add_argument(
+        '--city',
+        default='bishkek',
+        choices=list(CITIES.keys()),
+        help="City to scrape (default: bishkek)"
+    )
+    parser.add_argument(
+        '--test',
+        action='store_true',
+        help="Use test database (data/{city}_test.db)"
     )
     parser.add_argument(
         '--dry-run',
@@ -200,20 +215,26 @@ def main():
     parser.add_argument(
         '--pages',
         type=int,
-        default=TOTAL_PAGES,
-        help=f"Number of pages to scrape (default: {TOTAL_PAGES})"
+        default=None,
+        help="Number of pages to scrape (default: per-city config)"
     )
     args = parser.parse_args()
 
+    # Get city configuration
+    city_config = get_city_config(args.city, test=args.test)
+
+    # Resolve pages: CLI arg overrides city config
+    pages = args.pages or city_config['max_pages']
+
     # Setup logging
-    logger = setup_logging()
-    logger.info(f"Starting scraper (dry_run={args.dry_run}, pages={args.pages})")
+    logger = setup_logging(script_name=f"restaurants_{args.city}")
+    logger.info(f"Starting scraper for {city_config['name']} (dry_run={args.dry_run}, pages={pages})")
 
     # Initialize database (unless dry-run)
     db = None
     if not args.dry_run:
-        db = init_database(DB_PATH)
-        logger.info(f"Database initialized: {DB_PATH}")
+        db = init_database(city_config['db_path'])
+        logger.info(f"Database initialized: {city_config['db_path']}")
     else:
         logger.info("DRY RUN MODE - No database writes")
 
@@ -230,7 +251,7 @@ def main():
 
         # Navigate to page 1
         logger.info("Navigating to page 1...")
-        url = SEARCH_URL.format(page=1) if '{page}' in SEARCH_URL else SEARCH_URL
+        url = city_config['search_url'].format(page=1)
         driver.get(url)
         time.sleep(3)  # Wait for initial page load
 
@@ -241,30 +262,33 @@ def main():
         total_restaurants = 0
         all_restaurant_ids = set()
 
-        logger.info(f"Starting sequential scrape (pages 1 to {args.pages})")
+        logger.info(f"Starting sequential scrape (up to {pages} pages, stops when no more results)")
 
         # Start from page 2 (since we need an API call, and page 1 loads via initialState)
         actual_page = 1
-        for iteration in tqdm(range(1, args.pages + 1), desc="Scraping pages"):
+        for iteration in tqdm(range(1, pages + 1), desc="Scraping pages"):
             try:
                 # On first iteration, click to page 2 to trigger API call
                 if iteration == 1:
                     logger.debug("Iteration 1: Clicking to page 2 to trigger API call...")
-                    click_next_page(driver, 2, logger)
+                    if not click_next_page(driver, 2, logger):
+                        logger.info("No page 2 - only 1 page of results")
+                        break
                     actual_page = 2
 
-                logger.debug(f"Scraping page {actual_page}/{args.pages + 1}")
+                logger.debug(f"Scraping page {actual_page}/{pages + 1}")
 
                 # Extract restaurants from API response
                 current_restaurants = extract_api_response(driver, logger)
                 logger.debug(f"Found {len(current_restaurants)} restaurants on page {actual_page}")
 
                 if not current_restaurants:
-                    logger.warning(f"Page {actual_page}: No restaurants found! Skipping...")
-                    # Try to continue anyway
-                    if iteration < args.pages:
+                    logger.warning(f"Page {actual_page}: No restaurants found, skipping...")
+                    if iteration < pages:
                         actual_page += 1
-                        click_next_page(driver, actual_page, logger)
+                        if not click_next_page(driver, actual_page, logger):
+                            logger.info(f"Reached end of results at page {actual_page}")
+                            break
                     continue
 
                 # Log first restaurant for debugging
@@ -306,19 +330,19 @@ def main():
                 total_restaurants += len(current_restaurants)
 
                 # Click to next page (if not last iteration)
-                if iteration < args.pages:
+                if iteration < pages:
                     actual_page += 1
                     logger.debug(f"  Clicking to page {actual_page}...")
-                    click_next_page(driver, actual_page, logger)
+                    if not click_next_page(driver, actual_page, logger):
+                        logger.info(f"Reached end of results at page {actual_page - 1}")
+                        break
 
             except Exception as e:
                 logger.error(f"Page {actual_page} failed: {e}", exc_info=True)
                 # Try to continue anyway
-                if iteration < args.pages:
-                    try:
-                        actual_page += 1
-                        click_next_page(driver, actual_page, logger)
-                    except:
+                if iteration < pages:
+                    actual_page += 1
+                    if not click_next_page(driver, actual_page, logger):
                         break
                 continue
 
@@ -331,7 +355,7 @@ def main():
         if args.dry_run:
             logger.info("  DRY RUN - No data was saved to database")
         else:
-            logger.info(f"  Data saved to: {DB_PATH}")
+            logger.info(f"  Data saved to: {city_config['db_path']}")
 
     finally:
         # Always close browser

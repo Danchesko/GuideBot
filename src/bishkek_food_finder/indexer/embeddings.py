@@ -3,29 +3,33 @@
 Supports incremental updates — only embeds new reviews.
 
 Run: uv run python -m bishkek_food_finder.indexer.embeddings
+     uv run python -m bishkek_food_finder.indexer.embeddings --city almaty
 """
 
+import argparse
 import sqlite3
 from sentence_transformers import SentenceTransformer
 import chromadb
 from chromadb.errors import NotFoundError
 from tqdm import tqdm
 
-DB_PATH = "data/bishkek.db"
-CHROMA_PATH = "data/chroma"
-COLLECTION_NAME = "reviews"
+from bishkek_food_finder.scraper.config import CITIES, get_city_config
 
 MODEL_NAME = "cointegrated/rubert-tiny2"
 BATCH_SIZE = 128
+COLLECTION_NAME = "reviews"  # Will be used as-is (one collection per city chroma path)
+MIN_TRUST_DEFAULT = 0.3
 
 
-def load_reviews(conn) -> list[dict]:
-    """Load reviews from SQLite."""
+def load_reviews(conn, min_trust: float = MIN_TRUST_DEFAULT) -> list[dict]:
+    """Load reviews with trust score >= min_trust from SQLite."""
     rows = conn.execute("""
-        SELECT id, restaurant_id, text
-        FROM reviews
-        WHERE text IS NOT NULL AND text != ''
-    """).fetchall()
+        SELECT r.id, r.restaurant_id, r.text
+        FROM reviews r
+        JOIN review_trust rt ON r.id = rt.review_id
+        WHERE r.text IS NOT NULL AND r.text != ''
+          AND (rt.base_trust * rt.burst * rt.recency) >= ?
+    """, (min_trust,)).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -75,16 +79,65 @@ def add_to_collection(collection, reviews: list[dict], embeddings: list[list[flo
         )
 
 
+def delete_collection(chroma_path: str):
+    """Delete existing collection if it exists."""
+    client = chromadb.PersistentClient(path=chroma_path)
+    try:
+        client.delete_collection(name=COLLECTION_NAME)
+        return True
+    except NotFoundError:
+        return False
+
+
 def main():
-    conn = sqlite3.connect(DB_PATH)
+    parser = argparse.ArgumentParser(description="Build Chroma index from reviews")
+    parser.add_argument(
+        '--city',
+        default='bishkek',
+        choices=list(CITIES.keys()),
+        help="City to process (default: bishkek)"
+    )
+    parser.add_argument(
+        '--test',
+        action='store_true',
+        help="Use test paths (data/{city}_test.db, data/chroma_{city}_test)"
+    )
+    parser.add_argument(
+        '--rebuild',
+        action='store_true',
+        help="Delete existing collection and rebuild from scratch"
+    )
+    parser.add_argument(
+        '--min-trust',
+        type=float,
+        default=MIN_TRUST_DEFAULT,
+        help=f"Minimum trust score to include (default: {MIN_TRUST_DEFAULT})"
+    )
+    args = parser.parse_args()
+
+    city_config = get_city_config(args.city, test=args.test)
+    print(f"Processing {city_config['name']}...")
+    print(f"Database: {city_config['db_path']}")
+    print(f"Chroma: {city_config['chroma_path']}")
+    print(f"Min trust: {args.min_trust}\n")
+
+    conn = sqlite3.connect(city_config['db_path'])
     conn.row_factory = sqlite3.Row
 
-    print(f"Loading reviews from {DB_PATH}...")
-    reviews = load_reviews(conn)
-    print(f"Loaded {len(reviews):,} reviews with text")
+    print(f"Loading reviews with trust >= {args.min_trust}...")
+    reviews = load_reviews(conn, min_trust=args.min_trust)
+    print(f"Loaded {len(reviews):,} trusted reviews")
 
-    print(f"\nChecking Chroma collection at {CHROMA_PATH}...")
-    collection, is_new = get_or_create_collection(CHROMA_PATH)
+    # Handle rebuild
+    if args.rebuild:
+        print(f"\nDeleting existing collection...")
+        if delete_collection(city_config['chroma_path']):
+            print("Deleted existing collection")
+        else:
+            print("No existing collection to delete")
+
+    print(f"\nChecking Chroma collection at {city_config['chroma_path']}...")
+    collection, is_new = get_or_create_collection(city_config['chroma_path'])
 
     if is_new:
         print("Creating new collection")
