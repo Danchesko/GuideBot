@@ -364,61 +364,74 @@ def search(
 # === RESTAURANT LOOKUP ===
 
 def get_restaurant_details(
-    name: str,
-    max_reviews: int = 50,
+    name: str = None,
+    id: str = None,
+    address_hint: str = None,
+    max_reviews: int = 100,
     min_trust: float = 0.3,
 ) -> dict:
-    """Look up restaurant by name, return details + trusted reviews."""
+    """Look up restaurant by name, ID, or name+address."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
 
-    # Fuzzy match by name (case-insensitive)
-    restaurants = conn.execute("""
-        SELECT * FROM restaurants
-        WHERE LOWER(name) LIKE LOWER(?)
-        LIMIT 5
-    """, (f"%{name}%",)).fetchall()
+    # Priority 1: Exact ID lookup
+    if id:
+        restaurants = conn.execute(
+            "SELECT * FROM restaurants WHERE id = ?", (id,)
+        ).fetchall()
+    # Priority 2: Name + optional address hint
+    # Note: LIKE is case-sensitive for Cyrillic in SQLite, so we capitalize first letter
+    elif name:
+        # Capitalize first letter to match DB naming convention
+        name_cap = name[0].upper() + name[1:] if name else name
+        if address_hint:
+            address_cap = address_hint[0].upper() + address_hint[1:] if address_hint else address_hint
+            restaurants = conn.execute("""
+                SELECT * FROM restaurants
+                WHERE name LIKE ?
+                  AND address LIKE ?
+            """, (f"%{name_cap}%", f"%{address_cap}%")).fetchall()
+        else:
+            restaurants = conn.execute("""
+                SELECT * FROM restaurants
+                WHERE name LIKE ?
+            """, (f"%{name_cap}%",)).fetchall()
+    else:
+        conn.close()
+        return {"found": False, "message": "Provide name or id"}
 
     if not restaurants:
         conn.close()
-        return {"found": False, "message": f"No restaurant found matching '{name}'"}
-
-    if len(restaurants) > 1:
-        conn.close()
+        search_term = id or f"{name} {address_hint or ''}".strip()
         return {
             "found": False,
-            "candidates": [
-                {"id": r["id"], "name": r["name"], "address": r["address"]}
-                for r in restaurants
-            ],
-            "message": "Multiple matches. Please clarify which one."
+            "message": f"Restaurant '{search_term}' not found in database. Ask user to send their location or name a known restaurant nearby."
         }
 
-    restaurant = dict(restaurants[0])
+    # Build full details for ALL matching restaurants
+    results = []
+    for restaurant in restaurants:
+        restaurant = dict(restaurant)
 
-    # Get trusted reviews
-    reviews = conn.execute("""
-        SELECT r.text, r.rating, r.user_name,
-               rt.base_trust * rt.burst * rt.recency as trust
-        FROM reviews r
-        JOIN review_trust rt ON r.id = rt.review_id
-        WHERE r.restaurant_id = ?
-          AND (rt.base_trust * rt.burst * rt.recency) >= ?
-        ORDER BY trust DESC
-        LIMIT ?
-    """, (restaurant["id"], min_trust, max_reviews)).fetchall()
+        # Get trusted reviews
+        reviews = conn.execute("""
+            SELECT r.text, r.rating, r.user_name,
+                   rt.base_trust * rt.burst * rt.recency as trust
+            FROM reviews r
+            JOIN review_trust rt ON r.id = rt.review_id
+            WHERE r.restaurant_id = ?
+              AND (rt.base_trust * rt.burst * rt.recency) >= ?
+            ORDER BY trust DESC
+            LIMIT ?
+        """, (restaurant["id"], min_trust, max_reviews)).fetchall()
 
-    # Get stats
-    stats = conn.execute(
-        "SELECT * FROM restaurant_stats WHERE restaurant_id = ?",
-        (restaurant["id"],)
-    ).fetchone()
+        # Get stats
+        stats = conn.execute(
+            "SELECT * FROM restaurant_stats WHERE restaurant_id = ?",
+            (restaurant["id"],)
+        ).fetchone()
 
-    conn.close()
-
-    return {
-        "found": True,
-        "restaurant": {
+        results.append({
             "id": restaurant["id"],
             "name": restaurant["name"],
             "address": restaurant["address"],
@@ -430,12 +443,19 @@ def get_restaurant_details(
             "category": restaurant["category"],
             "cuisine": json.loads(restaurant["cuisine"]) if restaurant["cuisine"] else [],
             "avg_price_som": restaurant["avg_price_som"],
-            "link": f"https://2gis.kg/bishkek/firm/{restaurant['id']}"
-        },
-        "reviews": [
-            {"text": r["text"][:500], "rating": r["rating"], "trust": round(r["trust"], 2)}
-            for r in reviews
-        ]
+            "link": f"https://2gis.kg/bishkek/firm/{restaurant['id']}",
+            "reviews": [
+                {"text": r["text"][:500], "rating": r["rating"], "trust": round(r["trust"], 2)}
+                for r in reviews
+            ]
+        })
+
+    conn.close()
+
+    return {
+        "found": True,
+        "count": len(results),
+        "restaurants": results
     }
 
 

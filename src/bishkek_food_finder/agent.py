@@ -19,9 +19,9 @@ from bishkek_food_finder.search.pipeline import search, get_restaurant_details
 
 # === CONFIG ===
 
-MODEL = "claude-opus-4-5-20251101"
-MAX_ITERATIONS = 5
-MAX_RESTAURANTS = 30
+MODEL = "claude-sonnet-4-5-20250929"
+MAX_ITERATIONS = 7
+MAX_RESTAURANTS = 15
 MAX_REVIEWS = 30
 
 # === LOGGING ===
@@ -34,10 +34,10 @@ sh = logging.StreamHandler(); sh.setLevel(logging.WARNING); logger.addHandler(sh
 
 # === CLIENT ===
 
-if not os.environ.get("ANTHROPIC_API_KEY"):
-    raise EnvironmentError("ANTHROPIC_API_KEY not set")
+if not os.environ.get("LLM_API_KEY"):
+    raise EnvironmentError("LLM_API_KEY not set")
 
-client = Anthropic()
+client = Anthropic(api_key=os.environ["LLM_API_KEY"])
 
 
 # === HELPERS ===
@@ -123,8 +123,10 @@ def run(message: str, history: list = None) -> tuple[str, list, dict | None]:
                         result = execute_search(block.input)
                     elif block.name == "get_restaurant":
                         result = get_restaurant_details(
-                            name=block.input["name"],
-                            max_reviews=block.input.get("max_reviews", 50)
+                            name=block.input.get("name"),
+                            id=block.input.get("id"),
+                            address_hint=block.input.get("address_hint"),
+                            max_reviews=block.input.get("max_reviews", 100)
                         )
                     else:
                         result = {"error": "Unknown tool"}
@@ -184,7 +186,7 @@ SYSTEM_PROMPT = """Ты — бот для поиска ресторанов в �
    - "что поесть в Навват" → get_restaurant("Навват")
    - "как тебе Винтаж?" → get_restaurant("Винтаж")
    - "рядом с La Maison" → get_restaurant("La Maison") → использовать lat/lon для search_restaurants
-3. Если get_restaurant вернул несколько кандидатов — уточни у user какой именно
+3. get_restaurant возвращает ВСЕ филиалы с полной информацией — если несколько локаций, покажи все или спроси какая ближе к user
 4. Формулируй query конкретно на русском
 5. Используй radius_km когда user упоминает локацию:
    - "рядом", "близко" → 1
@@ -193,6 +195,14 @@ SYSTEM_PROMPT = """Ты — бот для поиска ресторанов в �
    - "в радиусе X км" → X
 6. Используй price_max когда user говорит "недорого" (~500), "средний бюджет" (~1500)
 7. ПРОВЕРЯЙ отзывы — поиск семантический, может найти ложные совпадения
+8. НЕ ПОВТОРЯЙ поиск с разными формулировками! Если результаты не идеальны:
+   - Расширь радиус (2→5 км) ИЛИ
+   - Отвечай с тем что есть, скажи что ближе не нашлось
+   - МАКСИМУМ 2 поиска на запрос
+9. Если get_restaurant вернул "found": false — попроси отправить локацию или назвать известный ресторан рядом
+10. Поиск по районам/регионам НЕ поддерживается:
+   - "в центре", "на юге", "в микрорайоне Асанбай" → скажи что поиск по районам пока не работает
+   - Предложи ТОЛЬКО: отправить локацию ИЛИ назвать ресторан рядом (НЕ парки, ТЦ, ориентиры — только рестораны!)
 
 ## Когда уточнять
 - "хочу поесть" → спроси кухню, бюджет, повод
@@ -285,6 +295,7 @@ SYSTEM_PROMPT = """Ты — бот для поиска ресторанов в �
 ## Стиль
 - Отвечай кратко, без воды и клише
 - Никаких "Отличный выбор!", "С удовольствием помогу!", "Конечно!"
+- НЕ используй markdown заголовки (###, ##) — только **жирный текст** для подзаголовков
 - Просто результаты — чисто и по делу
 - Если ничего не найдено — скажи прямо, предложи расширить критерии
 
@@ -315,15 +326,16 @@ IMPORTANT: Search is semantic, not keyword. YOU must verify reviews match what u
     }
 }, {
     "name": "get_restaurant",
-    "description": """Look up a specific restaurant by name. Returns details + all trusted reviews.
-Use when user asks about a SPECIFIC place: what to eat there, opinion, or to get its location for nearby search.""",
+    "description": """Look up restaurant by name, ID, or name+address. Returns details + trusted reviews.
+Use ID for exact match from previous search results. Use address_hint to narrow down (e.g., name="винтаж", address_hint="токомбаева").""",
     "input_schema": {
         "type": "object",
         "properties": {
-            "name": {"type": "string", "description": "Restaurant name (partial match OK)"},
-            "max_reviews": {"type": "integer", "description": "Max reviews to return. Default: 50"}
-        },
-        "required": ["name"]
+            "name": {"type": "string", "description": "Restaurant name (partial match)"},
+            "id": {"type": "string", "description": "Exact restaurant ID from previous search results"},
+            "address_hint": {"type": "string", "description": "Address fragment to narrow results (e.g., 'токомбаева')"},
+            "max_reviews": {"type": "integer", "description": "Max reviews to return. Default: 100"}
+        }
     }
 }]
 
