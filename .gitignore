@@ -1,5 +1,10 @@
+# Secrets
+.env
+.env.*
+
 .claude/
 ai-context/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -14,9 +19,9 @@ env/
 # uv
 .uv/
 
-# Database
-data/*.db
-data/*.db-journal
+# Data (large files)
+data/
+docs/
 
 # IDE
 .vscode/
@@ -27,4 +32,4 @@ data/*.db-journal
 .DS_Store
 Thumbs.db
 # Logs
-logs/*.log
+logs/

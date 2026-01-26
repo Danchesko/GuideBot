@@ -25,13 +25,6 @@ MODEL_NAME = "cointegrated/rubert-tiny2"
 SENTIMENT = {1: -1.0, 2: -0.5, 3: 0.0, 4: 0.5, 5: 1.0}
 MIN_SIMILARITY = 0.7
 
-GEO_PRESETS = {
-    "walking": {"max_km": 3, "decay": 0.4},
-    "nearby": {"max_km": 5, "decay": 0.2},
-    "driving": {"max_km": 10, "decay": 0.0},
-    "city_wide": {"max_km": None, "decay": 0.0},
-}
-
 # === LAZY LOADING ===
 
 _model = None
@@ -297,12 +290,11 @@ def aggregate_by_restaurant(scored_reviews: list[dict]) -> list[dict]:
 def apply_geo_decay(
     restaurants: list[dict],
     location: tuple,
-    geo_preset: str,
+    radius_km: float = None,
 ) -> list[dict]:
-    """Apply geo decay and add distance. Decay only for 'walking'."""
-    preset = GEO_PRESETS.get(geo_preset, GEO_PRESETS["city_wide"])
-    max_km = preset["max_km"]
-    decay = preset["decay"]
+    """Apply geo decay and add distance. Auto-decay for small radii (<=3km)."""
+    # Auto-decay: prefer closer places when walking
+    decay = 0.4 if radius_km and radius_km <= 3 else 0.0
 
     lat, lon = location
 
@@ -313,13 +305,13 @@ def apply_geo_decay(
 
         dist = haversine_km(lat, lon, r["lat"], r["lon"])
 
-        if max_km and dist > max_km:
+        if radius_km and dist > radius_km:
             continue
 
         r["distance_km"] = round(dist, 2)
 
-        if decay > 0 and max_km:
-            geo_factor = max(0, 1 - decay * dist / max_km)
+        if decay > 0 and radius_km:
+            geo_factor = max(0, 1 - decay * dist / radius_km)
             r["score"] *= geo_factor
 
         result.append(r)
@@ -332,7 +324,7 @@ def apply_geo_decay(
 def search(
     query: str,
     location: tuple = None,
-    geo_preset: str = None,
+    radius_km: float = None,
     price_max: int = None,
     open_now: bool = False,
     n_reviews: int = 500,
@@ -343,14 +335,10 @@ def search(
     conn.row_factory = sqlite3.Row
 
     # 1. Get filtered restaurant IDs
-    max_km = None
-    if geo_preset:
-        max_km = GEO_PRESETS.get(geo_preset, {}).get("max_km")
-
     restaurant_ids = get_filtered_restaurants(
         conn,
         location=location,
-        max_km=max_km,
+        max_km=radius_km,
         price_max=price_max,
         open_now=open_now,
     )
@@ -366,11 +354,89 @@ def search(
 
     # 5. Apply geo decay
     if location:
-        restaurants = apply_geo_decay(restaurants, location, geo_preset or "city_wide")
+        restaurants = apply_geo_decay(restaurants, location, radius_km)
 
     conn.close()
 
     return restaurants[:top_k]
+
+
+# === RESTAURANT LOOKUP ===
+
+def get_restaurant_details(
+    name: str,
+    max_reviews: int = 50,
+    min_trust: float = 0.3,
+) -> dict:
+    """Look up restaurant by name, return details + trusted reviews."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+
+    # Fuzzy match by name (case-insensitive)
+    restaurants = conn.execute("""
+        SELECT * FROM restaurants
+        WHERE LOWER(name) LIKE LOWER(?)
+        LIMIT 5
+    """, (f"%{name}%",)).fetchall()
+
+    if not restaurants:
+        conn.close()
+        return {"found": False, "message": f"No restaurant found matching '{name}'"}
+
+    if len(restaurants) > 1:
+        conn.close()
+        return {
+            "found": False,
+            "candidates": [
+                {"id": r["id"], "name": r["name"], "address": r["address"]}
+                for r in restaurants
+            ],
+            "message": "Multiple matches. Please clarify which one."
+        }
+
+    restaurant = dict(restaurants[0])
+
+    # Get trusted reviews
+    reviews = conn.execute("""
+        SELECT r.text, r.rating, r.user_name,
+               rt.base_trust * rt.burst * rt.recency as trust
+        FROM reviews r
+        JOIN review_trust rt ON r.id = rt.review_id
+        WHERE r.restaurant_id = ?
+          AND (rt.base_trust * rt.burst * rt.recency) >= ?
+        ORDER BY trust DESC
+        LIMIT ?
+    """, (restaurant["id"], min_trust, max_reviews)).fetchall()
+
+    # Get stats
+    stats = conn.execute(
+        "SELECT * FROM restaurant_stats WHERE restaurant_id = ?",
+        (restaurant["id"],)
+    ).fetchone()
+
+    conn.close()
+
+    return {
+        "found": True,
+        "restaurant": {
+            "id": restaurant["id"],
+            "name": restaurant["name"],
+            "address": restaurant["address"],
+            "lat": restaurant["lat"],
+            "lon": restaurant["lon"],
+            "rating_2gis": restaurant["rating"],
+            "rating_trusted": round(stats["weighted_rating"], 2) if stats else None,
+            "trusted_review_count": stats["trusted_review_count"] if stats else 0,
+            "category": restaurant["category"],
+            "cuisine": json.loads(restaurant["cuisine"]) if restaurant["cuisine"] else [],
+            "avg_price_som": restaurant["avg_price_som"],
+            "link": f"https://2gis.kg/bishkek/firm/{restaurant['id']}"
+        },
+        "reviews": [
+            {"text": r["text"][:500], "rating": r["rating"], "trust": round(r["trust"], 2)}
+            for r in reviews
+        ]
+    }
 
 
 # === CLI ===
@@ -408,7 +474,7 @@ def main():
     parser.add_argument("--top", type=int, default=10, help="Number of results")
     parser.add_argument("--lat", type=float, help="Latitude")
     parser.add_argument("--lon", type=float, help="Longitude")
-    parser.add_argument("--geo", choices=["walking", "nearby", "driving", "city_wide"], help="Geo preset")
+    parser.add_argument("--radius", type=float, help="Search radius in km")
     parser.add_argument("--price-max", type=int, help="Max price filter")
     parser.add_argument("--open-now", action="store_true", help="Only open restaurants")
     parser.add_argument("--json", action="store_true", help="JSON output")
@@ -419,7 +485,7 @@ def main():
     results = search(
         query=args.query,
         location=location,
-        geo_preset=args.geo,
+        radius_km=args.radius,
         price_max=args.price_max,
         open_now=args.open_now,
         top_k=args.top,

@@ -92,22 +92,22 @@ async def fetch_reviews_page_with_retry(client, url, params=None, max_retries=MA
             await asyncio.sleep(wait_time)
 
 
-async def fetch_all_reviews_for_restaurant(client, restaurant_id, restaurant_name, latest_review_date):
+async def fetch_all_reviews_for_restaurant(client, restaurant_id, restaurant_name, existing_ids):
     """Fetch reviews for a single restaurant with pagination and incremental update support.
 
-    Hybrid approach:
-    - Stream pages and filter per page (date_created > latest_review_date)
-    - Early stop when entire page is old (all reviews <= latest_review_date)
+    ID-based approach:
+    - Stream pages and filter per page (skip IDs we already have)
+    - Early stop when entire page already exists
     - Return all new reviews for batch save
 
     Args:
         client: httpx.AsyncClient instance
         restaurant_id: Restaurant ID
         restaurant_name: Restaurant name (for logging and storing)
-        latest_review_date: ISO timestamp string of newest review we have (or None for first run)
+        existing_ids: Set of review IDs we already have for this restaurant
 
     Returns:
-        list[dict]: All NEW reviews (filtered by date if latest_review_date provided)
+        list[dict]: All NEW reviews (filtered by existing IDs)
     """
     logger = logging.getLogger(__name__)
 
@@ -122,19 +122,16 @@ async def fetch_all_reviews_for_restaurant(client, restaurant_id, restaurant_nam
             data = await fetch_reviews_page_with_retry(client, url, params)
             page_reviews, next_link = parse_reviews_page(data, restaurant_name)
 
-            # Filter: only keep reviews newer than what we have
-            if latest_review_date:
-                new_reviews = [r for r in page_reviews if r['date_created'] > latest_review_date]
-            else:
-                new_reviews = page_reviews  # First run, all are new
+            # Filter: only keep reviews we don't have yet
+            new_reviews = [r for r in page_reviews if r['id'] not in existing_ids]
 
             all_new_reviews.extend(new_reviews)
 
             logger.debug(f"{restaurant_name}: Page {page_num}, got {len(page_reviews)} reviews, {len(new_reviews)} new")
 
-            # EARLY STOP: If ALL reviews in page are old, stop pagination
-            if latest_review_date and len(new_reviews) == 0:
-                logger.debug(f"{restaurant_name}: All reviews in page older than {latest_review_date}, stopping")
+            # EARLY STOP: If ALL reviews in page already exist, stop pagination
+            if existing_ids and len(new_reviews) == 0:
+                logger.debug(f"{restaurant_name}: All reviews in page already exist, stopping")
                 break
 
             # Next page
@@ -153,7 +150,7 @@ async def fetch_all_reviews_for_restaurant(client, restaurant_id, restaurant_nam
     return all_new_reviews
 
 
-async def process_restaurant(client, db, restaurant_id, restaurant_name, latest_review_date, semaphore, stats_only=False):
+async def process_restaurant(client, db, restaurant_id, restaurant_name, semaphore, stats_only=False):
     """Process one restaurant: fetch reviews, optionally save to DB, return stats.
 
     Args:
@@ -161,7 +158,6 @@ async def process_restaurant(client, db, restaurant_id, restaurant_name, latest_
         db: sqlite3.Connection (used synchronously within async context)
         restaurant_id: Restaurant ID
         restaurant_name: Restaurant name
-        latest_review_date: ISO timestamp of newest review we have (or None)
         semaphore: asyncio.Semaphore for concurrency control
         stats_only: If True, fetch but don't save to database
 
@@ -172,13 +168,19 @@ async def process_restaurant(client, db, restaurant_id, restaurant_name, latest_
 
     async with semaphore:
         try:
-            # Fetch reviews (with incremental update if latest_review_date provided)
+            # Get existing review IDs for this restaurant
+            cursor = db.execute(
+                "SELECT id FROM reviews WHERE restaurant_id = ?", (restaurant_id,)
+            )
+            existing_ids = {row[0] for row in cursor.fetchall()}
+
+            # Fetch reviews (with incremental update using existing IDs)
             reviews = await fetch_all_reviews_for_restaurant(
-                client, restaurant_id, restaurant_name, latest_review_date
+                client, restaurant_id, restaurant_name, existing_ids
             )
 
             # If no new reviews and we already had some
-            if len(reviews) == 0 and latest_review_date:
+            if len(reviews) == 0 and existing_ids:
                 if not stats_only:
                     db.execute("""
                         UPDATE restaurants
@@ -209,20 +211,13 @@ async def process_restaurant(client, db, restaurant_id, restaurant_name, latest_
                         r['is_verified'], r['is_hidden'], r['has_official_answer']
                     ))
 
-                # Calculate latest review date from saved reviews
-                if reviews:
-                    max_date = max(r['date_created'] for r in reviews)
-                else:
-                    max_date = None
-
-                # Mark success and update latest_review_date
+                # Mark success
                 db.execute("""
                     UPDATE restaurants
                     SET reviews_fetched_at = CURRENT_TIMESTAMP,
-                        reviews_fetch_error = NULL,
-                        latest_review_date = ?
+                        reviews_fetch_error = NULL
                     WHERE id = ?
-                """, (max_date if max_date else None, restaurant_id))
+                """, (restaurant_id,))
                 db.commit()
 
             logger.info(f"{restaurant_name}: ✓ {'Found' if stats_only else 'Saved'} {len(reviews)} reviews")
@@ -265,10 +260,10 @@ async def main_async(args, db, restaurants):
     async with httpx.AsyncClient() as client:
         tasks = [
             process_restaurant(
-                client, db, rest_id, name, latest_date, semaphore,
+                client, db, rest_id, name, semaphore,
                 stats_only=args.stats_only
             )
-            for rest_id, name, latest_date in restaurants
+            for rest_id, name in restaurants
         ]
 
         # Run with progress bar and collect results
@@ -337,11 +332,11 @@ def main():
     # Get restaurants that need reviews
     # Either: never fetched OR not checked in N days
     cursor = db.execute("""
-        SELECT id, name, latest_review_date
+        SELECT id, name
         FROM restaurants
         WHERE (
-            latest_review_date IS NULL
-            OR latest_review_date < datetime('now', '-' || ? || ' days')
+            reviews_fetched_at IS NULL
+            OR reviews_fetched_at < datetime('now', '-' || ? || ' days')
         )
         AND reviews_fetch_attempts < ?
         ORDER BY rowid
@@ -361,9 +356,8 @@ def main():
 
     if args.dry_run:
         print("DRY RUN - Listing restaurants that would be processed:\n")
-        for rest_id, name, latest in restaurants[:10]:  # Show first 10
-            status = "never checked" if not latest else f"last: {latest}"
-            print(f"  - {name} ({rest_id}) [{status}]")
+        for rest_id, name in restaurants[:10]:  # Show first 10
+            print(f"  - {name} ({rest_id})")
         if len(restaurants) > 10:
             print(f"  ... and {len(restaurants) - 10} more")
         db.close()

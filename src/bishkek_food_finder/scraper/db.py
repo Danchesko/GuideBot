@@ -37,8 +37,7 @@ def init_database(db_path):
             scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             reviews_fetched_at TIMESTAMP,
             reviews_fetch_error TEXT,
-            reviews_fetch_attempts INTEGER DEFAULT 0,
-            latest_review_date TIMESTAMP
+            reviews_fetch_attempts INTEGER DEFAULT 0
         )
     """)
 
