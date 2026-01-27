@@ -5,17 +5,16 @@ Run: uv run python -m bishkek_food_finder.bot
 
 import asyncio
 import json
-import logging
 import os
 import tempfile
 from functools import wraps
-from pathlib import Path
 
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 from bishkek_food_finder.agent import run as agent_run
+from bishkek_food_finder.log import setup_service_logging
 from bishkek_food_finder.scraper.config import CITIES, get_city_config
 
 load_dotenv()
@@ -47,11 +46,7 @@ def get_main_keyboard(city: str) -> ReplyKeyboardMarkup:
 
 # === LOGGING ===
 
-Path("logs").mkdir(exist_ok=True)
-logger = logging.getLogger("bishkek_food_finder.bot")
-logger.setLevel(logging.DEBUG)
-logger.addHandler(logging.FileHandler("logs/bot.log"))
-logger.addHandler(logging.StreamHandler())
+logger = setup_service_logging("bot")
 
 
 # === HELPERS ===

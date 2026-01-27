@@ -9,12 +9,14 @@ Run: uv run python -m bishkek_food_finder.indexer.trust
 """
 
 import argparse
+import logging
 import sqlite3
 import re
 from math import log
 from datetime import datetime
 from collections import defaultdict
 
+from bishkek_food_finder.log import setup_logging
 from bishkek_food_finder.scraper.config import CITIES, get_city_config
 
 # === TRUST CONFIG ===
@@ -173,14 +175,16 @@ def main():
     args = parser.parse_args()
 
     city_config = get_city_config(args.city, test=args.test)
-    print(f"Processing {city_config['name']}...")
-    print(f"Database: {city_config['db_path']}\n")
+
+    logger = setup_logging(script_name=f"trust_{args.city}")
+    logger.info(f"Processing {city_config['name']}...")
+    logger.info(f"Database: {city_config['db_path']}")
 
     conn = sqlite3.connect(city_config['db_path'])
     conn.row_factory = sqlite3.Row
 
     # === PHASE 1: Review Trust ===
-    print("=== Review Trust ===")
+    logger.info("=== Review Trust ===")
 
     conn.execute("DROP TABLE IF EXISTS review_trust")
     conn.execute("""
@@ -205,12 +209,12 @@ def main():
         }
         for r in rows
     ]
-    print(f"Loaded {len(reviews):,} reviews")
+    logger.info(f"Loaded {len(reviews):,} reviews")
 
     reference_date = max(r['date'] for r in reviews)
-    print(f"Reference date: {reference_date.date()}")
+    logger.info(f"Reference date: {reference_date.date()}")
 
-    print("Computing review trust...")
+    logger.info("Computing review trust...")
     review_trust = compute_review_trust(reviews, reference_date)
 
     conn.executemany("INSERT INTO review_trust VALUES (?, ?, ?, ?)", review_trust)
@@ -226,13 +230,13 @@ def main():
         FROM review_trust
     """).fetchone()
 
-    print(f"  {stats['n']:,} reviews indexed")
-    print(f"  base_trust avg: {stats['avg_base']}")
-    print(f"  burst avg: {stats['avg_burst']} ({stats['burst_flagged']:,} flagged)")
-    print(f"  recency avg: {stats['avg_recency']}")
+    logger.info(f"  {stats['n']:,} reviews indexed")
+    logger.info(f"  base_trust avg: {stats['avg_base']}")
+    logger.info(f"  burst avg: {stats['avg_burst']} ({stats['burst_flagged']:,} flagged)")
+    logger.info(f"  recency avg: {stats['avg_recency']}")
 
     # === PHASE 2: Restaurant Stats ===
-    print("\n=== Restaurant Stats ===")
+    logger.info("=== Restaurant Stats ===")
 
     conn.execute("DROP TABLE IF EXISTS restaurant_stats")
     conn.execute("""
@@ -251,9 +255,9 @@ def main():
         FROM reviews r
         JOIN review_trust rt ON r.id = rt.review_id
     """).fetchone()['avg']
-    print(f"Global weighted average: {global_avg:.2f}")
+    logger.info(f"Global weighted average: {global_avg:.2f}")
 
-    print("Computing restaurant stats...")
+    logger.info("Computing restaurant stats...")
     restaurant_stats = compute_restaurant_stats(conn, global_avg)
 
     conn.executemany("INSERT INTO restaurant_stats VALUES (?, ?, ?, ?)", restaurant_stats)
@@ -268,13 +272,13 @@ def main():
         FROM restaurant_stats
     """).fetchone()
 
-    print(f"  {stats['n']:,} restaurants indexed")
-    print(f"  weighted_rating avg: {stats['avg_rating']}")
-    print(f"  trusted_review_count avg: {stats['avg_trusted']}")
-    print(f"  confidence_score avg: {stats['avg_confidence']}")
+    logger.info(f"  {stats['n']:,} restaurants indexed")
+    logger.info(f"  weighted_rating avg: {stats['avg_rating']}")
+    logger.info(f"  trusted_review_count avg: {stats['avg_trusted']}")
+    logger.info(f"  confidence_score avg: {stats['avg_confidence']}")
 
     conn.close()
-    print("\nDone!")
+    logger.info("Done!")
 
 
 if __name__ == "__main__":

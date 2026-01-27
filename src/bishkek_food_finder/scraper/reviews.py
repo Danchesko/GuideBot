@@ -8,8 +8,9 @@ from datetime import datetime
 import httpx
 from tqdm.asyncio import tqdm
 
+from bishkek_food_finder.log import setup_logging
 from .config import (
-    setup_logging, REVIEWS_API_URL, REVIEWS_API_KEY,
+    REVIEWS_API_URL, REVIEWS_API_KEY,
     REVIEWS_PAGE_LIMIT, MAX_CONCURRENT_RESTAURANTS, MAX_RETRIES,
     RETRY_BACKOFF_BASE, CITIES, get_city_config
 )
@@ -333,7 +334,7 @@ def main():
     city_config = get_city_config(args.city, test=args.test)
 
     # Setup logging
-    logger = setup_logging(script_name=f"reviews_{args.city}")
+    logger = setup_logging(script_name=f"reviews_{args.city}", console_level=logging.WARNING)
 
     # Print to console (not logged)
     print(f"\n{'='*60}")

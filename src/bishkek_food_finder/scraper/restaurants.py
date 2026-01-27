@@ -30,7 +30,8 @@ import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
-from .config import setup_logging, CITIES, get_city_config
+from bishkek_food_finder.log import setup_logging
+from .config import CITIES, get_city_config
 from .db import init_database
 
 
@@ -227,7 +228,7 @@ def main():
     pages = args.pages or city_config['max_pages']
 
     # Setup logging
-    logger = setup_logging(script_name=f"restaurants_{args.city}")
+    logger = setup_logging(script_name=f"restaurants_{args.city}", console_level=logging.WARNING)
     logger.info(f"Starting scraper for {city_config['name']} (dry_run={args.dry_run}, pages={pages})")
 
     # Initialize database (unless dry-run)

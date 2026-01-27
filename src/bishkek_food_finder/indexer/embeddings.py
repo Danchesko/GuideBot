@@ -7,12 +7,15 @@ Run: uv run python -m bishkek_food_finder.indexer.embeddings
 """
 
 import argparse
+import logging
 import sqlite3
+
 from sentence_transformers import SentenceTransformer
 import chromadb
 from chromadb.errors import NotFoundError
 from tqdm import tqdm
 
+from bishkek_food_finder.log import setup_logging
 from bishkek_food_finder.scraper.config import CITIES, get_city_config
 
 MODEL_NAME = "cointegrated/rubert-tiny2"
@@ -116,54 +119,56 @@ def main():
     args = parser.parse_args()
 
     city_config = get_city_config(args.city, test=args.test)
-    print(f"Processing {city_config['name']}...")
-    print(f"Database: {city_config['db_path']}")
-    print(f"Chroma: {city_config['chroma_path']}")
-    print(f"Min trust: {args.min_trust}\n")
+
+    logger = setup_logging(script_name=f"embeddings_{args.city}")
+    logger.info(f"Processing {city_config['name']}...")
+    logger.info(f"Database: {city_config['db_path']}")
+    logger.info(f"Chroma: {city_config['chroma_path']}")
+    logger.info(f"Min trust: {args.min_trust}")
 
     conn = sqlite3.connect(city_config['db_path'])
     conn.row_factory = sqlite3.Row
 
-    print(f"Loading reviews with trust >= {args.min_trust}...")
+    logger.info(f"Loading reviews with trust >= {args.min_trust}...")
     reviews = load_reviews(conn, min_trust=args.min_trust)
-    print(f"Loaded {len(reviews):,} trusted reviews")
+    logger.info(f"Loaded {len(reviews):,} trusted reviews")
 
     # Handle rebuild
     if args.rebuild:
-        print(f"\nDeleting existing collection...")
+        logger.info("Deleting existing collection...")
         if delete_collection(city_config['chroma_path']):
-            print("Deleted existing collection")
+            logger.info("Deleted existing collection")
         else:
-            print("No existing collection to delete")
+            logger.info("No existing collection to delete")
 
-    print(f"\nChecking Chroma collection at {city_config['chroma_path']}...")
+    logger.info(f"Checking Chroma collection at {city_config['chroma_path']}...")
     collection, is_new = get_or_create_collection(city_config['chroma_path'])
 
     if is_new:
-        print("Creating new collection")
+        logger.info("Creating new collection")
         new_reviews = reviews
     else:
-        print(f"Found existing collection with {collection.count():,} vectors")
+        logger.info(f"Found existing collection with {collection.count():,} vectors")
         existing_ids = get_existing_ids(collection)
         new_reviews = [r for r in reviews if r['id'] not in existing_ids]
-        print(f"Found {len(new_reviews):,} new reviews to index")
+        logger.info(f"Found {len(new_reviews):,} new reviews to index")
 
     if not new_reviews:
-        print("\nNo new reviews to index. Done!")
+        logger.info("No new reviews to index. Done!")
         conn.close()
         return
 
-    print(f"\nLoading model: {MODEL_NAME}")
+    logger.info(f"Loading model: {MODEL_NAME}")
     model = SentenceTransformer(MODEL_NAME)
 
-    print(f"\nEmbedding {len(new_reviews):,} reviews (batch_size={BATCH_SIZE})...")
+    logger.info(f"Embedding {len(new_reviews):,} reviews (batch_size={BATCH_SIZE})...")
     texts = [r['text'] for r in new_reviews]
     embeddings = embed_texts(model, texts)
 
-    print(f"\nAdding to Chroma...")
+    logger.info("Adding to Chroma...")
     add_to_collection(collection, new_reviews, embeddings)
 
-    print(f"\nDone! Collection '{COLLECTION_NAME}' now has {collection.count():,} vectors")
+    logger.info(f"Done! Collection '{COLLECTION_NAME}' now has {collection.count():,} vectors")
     conn.close()
 
 

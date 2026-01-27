@@ -8,6 +8,7 @@ Run: uv run python -m bishkek_food_finder.search.pipeline "уютное мест
 
 import argparse
 import json
+import logging
 import sqlite3
 from collections import defaultdict
 from datetime import datetime
@@ -17,6 +18,8 @@ from sentence_transformers import SentenceTransformer
 import chromadb
 
 from bishkek_food_finder.scraper.config import CITIES, get_city_config
+
+logger = logging.getLogger(__name__)
 
 COLLECTION_NAME = "reviews"
 MODEL_NAME = "cointegrated/rubert-tiny2"
@@ -228,7 +231,7 @@ def score_reviews(conn, chroma_results: list[dict]) -> list[dict]:
 
         trust = review["trust"] or 0.0
         sentiment = SENTIMENT.get(review["rating"], 0.0)
-        score = similarity * trust * sentiment
+        score = (similarity ** 3) * trust * sentiment
 
         scored.append({
             **review,
@@ -338,6 +341,8 @@ def search(
     top_k: int = 10,
 ) -> list[dict]:
     """Main search pipeline."""
+    logger.debug(f"Search: query='{query}', city={city}, location={location}, radius={radius_km}, price_max={price_max}")
+
     city_config = get_city_config(city)
     conn = sqlite3.connect(city_config['db_path'])
     conn.row_factory = sqlite3.Row
@@ -350,19 +355,24 @@ def search(
         price_max=price_max,
         open_now=open_now,
     )
+    logger.debug(f"Filter: {len(restaurant_ids) if restaurant_ids else 'all'} restaurants")
 
     # 2. Chroma search
     chroma_results = search_chroma(query, city=city, n_results=n_reviews, restaurant_ids=restaurant_ids)
+    logger.debug(f"Chroma: {len(chroma_results)} results above {MIN_SIMILARITY} similarity")
 
     # 3. Score reviews
     scored = score_reviews(conn, chroma_results)
+    logger.debug(f"Scored: {len(scored)} reviews")
 
     # 4. Aggregate by restaurant
     restaurants = aggregate_by_restaurant(scored, city=city)
+    logger.debug(f"Aggregated: {len(restaurants)} restaurants")
 
     # 5. Apply geo decay
     if location:
         restaurants = apply_geo_decay(restaurants, location, radius_km)
+        logger.debug(f"Geo filtered: {len(restaurants)} restaurants")
 
     conn.close()
 
@@ -596,6 +606,8 @@ def print_results(results: list[dict], json_output: bool = False):
 
 
 def main():
+    from bishkek_food_finder.log import setup_logging
+
     parser = argparse.ArgumentParser(description="Search restaurants")
     parser.add_argument("query", help="Search query")
     parser.add_argument("--city", default="bishkek", choices=list(CITIES.keys()), help="City to search")
@@ -607,6 +619,8 @@ def main():
     parser.add_argument("--open-now", action="store_true", help="Only open restaurants")
     parser.add_argument("--json", action="store_true", help="JSON output")
     args = parser.parse_args()
+
+    setup_logging(script_name=f"search_{args.city}")
 
     city_config = get_city_config(args.city)
     print(f"Searching in {city_config['name']}...\n")

@@ -6,9 +6,8 @@ Run: uv run python -m bishkek_food_finder.agent "где вкусный плов"
 
 import argparse
 import json
-import logging
 import os
-from pathlib import Path
+import time
 
 from dotenv import load_dotenv
 from anthropic import Anthropic
@@ -16,6 +15,7 @@ from anthropic import Anthropic
 load_dotenv()
 
 from bishkek_food_finder.search.pipeline import search, get_restaurant_details
+from bishkek_food_finder.log import setup_service_logging
 from bishkek_food_finder.scraper.config import CITIES, get_city_config
 
 # === CONFIG ===
@@ -27,11 +27,7 @@ MAX_REVIEWS = 30
 
 # === LOGGING ===
 
-Path("logs").mkdir(exist_ok=True)
-logger = logging.getLogger("bishkek_food_finder.agent")
-logger.setLevel(logging.DEBUG)
-logger.addHandler(logging.FileHandler("logs/agent.log"))
-sh = logging.StreamHandler(); sh.setLevel(logging.WARNING); logger.addHandler(sh)
+logger = setup_service_logging("agent")
 
 # === CLIENT ===
 
@@ -89,20 +85,45 @@ def execute_search(params: dict, city: str = "bishkek") -> dict:
 
 # === AGENT LOOP ===
 
+def _summarize_tool_result(name: str, result: dict) -> str:
+    """One-line summary of tool result for logging."""
+    if "error" in result:
+        return f"ERROR: {result['error']}"
+    if name == "search_restaurants":
+        count = result.get("count", 0)
+        if count == 0:
+            return "0 restaurants found"
+        names = [r["name"] for r in result.get("restaurants", [])[:5]]
+        return f"{count} restaurants: {', '.join(names)}{'...' if count > 5 else ''}"
+    if name == "get_restaurant":
+        if not result.get("found"):
+            return f"not found: {result.get('message', '')[:80]}"
+        if result.get("multiple"):
+            return f"{result['count']} locations found"
+        r = result.get("restaurant", {})
+        return f"found: {r.get('name', '?')} ({r.get('trusted_review_count', 0)} trusted reviews)"
+    return json.dumps(result, ensure_ascii=False)[:100]
+
+
 def run(message: str, history: list = None, city: str = "bishkek") -> tuple[str, list, dict | None]:
     """Run agent. Returns (response, updated_history, last_search_results)."""
     city_config = get_city_config(city)
     city_name = city_config['name']
+    run_start = time.time()
 
-    # Build city-specific system prompt
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(city_name=city_name)
 
     messages = list(history) if history else []
     messages.append({"role": "user", "content": message})
+    logger.info(f"{'='*60}")
     logger.info(f"USER ({city}): {message}")
     last_results = None
 
-    for _ in range(MAX_ITERATIONS):
+    for iteration in range(1, MAX_ITERATIONS + 1):
+        logger.info(f"--- Iteration {iteration}/{MAX_ITERATIONS} ---")
+
+        # LLM call
+        t0 = time.time()
         response = client.messages.create(
             model=MODEL,
             max_tokens=4096,
@@ -110,12 +131,28 @@ def run(message: str, history: list = None, city: str = "bishkek") -> tuple[str,
             tools=TOOLS,
             messages=messages
         )
+        llm_time = time.time() - t0
+        tokens_in = response.usage.input_tokens
+        tokens_out = response.usage.output_tokens
+        logger.info(f"LLM: {llm_time:.1f}s | {tokens_in}in/{tokens_out}out tokens | stop={response.stop_reason}")
+
+        # Log thinking (text blocks before/alongside tool calls)
+        for block in response.content:
+            if hasattr(block, "text") and block.text:
+                # Truncate long thinking for log readability
+                text = block.text
+                if len(text) > 500:
+                    text = text[:500] + f"... ({len(block.text)} chars total)"
+                logger.info(f"THINKING: {text}")
 
         # Final response
         if response.stop_reason == "end_turn":
             text = next((b.text for b in response.content if hasattr(b, "text")), "")
             messages.append({"role": "assistant", "content": response.content})
-            logger.info(f"RESPONSE: {text[:200]}...")
+            total_time = time.time() - run_start
+            logger.info(f"RESPONSE ({len(text)} chars): {text[:300]}{'...' if len(text) > 300 else ''}")
+            logger.info(f"DONE: {iteration} iteration(s), {total_time:.1f}s total")
+            logger.info(f"{'='*60}")
             return text, messages, last_results
 
         # Tool calls
@@ -125,8 +162,9 @@ def run(message: str, history: list = None, city: str = "bishkek") -> tuple[str,
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
-                    logger.info(f"TOOL: {block.name}({json.dumps(block.input, ensure_ascii=False)})")
+                    logger.info(f"TOOL_CALL: {block.name}({json.dumps(block.input, ensure_ascii=False)})")
 
+                    t0 = time.time()
                     if block.name == "search_restaurants":
                         result = execute_search(block.input, city=city)
                     elif block.name == "get_restaurant":
@@ -139,8 +177,12 @@ def run(message: str, history: list = None, city: str = "bishkek") -> tuple[str,
                         )
                     else:
                         result = {"error": "Unknown tool"}
+                    tool_time = time.time() - t0
 
-                    logger.debug(f"TOOL_RESULT: {json.dumps(result, ensure_ascii=False)}")
+                    summary = _summarize_tool_result(block.name, result)
+                    logger.info(f"TOOL_RESULT ({tool_time:.1f}s): {summary}")
+                    logger.debug(f"TOOL_RESULT_FULL: {json.dumps(result, ensure_ascii=False)}")
+
                     last_results = result
                     tool_results.append({
                         "type": "tool_result",
@@ -150,7 +192,8 @@ def run(message: str, history: list = None, city: str = "bishkek") -> tuple[str,
 
             messages.append({"role": "user", "content": tool_results})
 
-    logger.warning("MAX_ITERATIONS reached")
+    total_time = time.time() - run_start
+    logger.warning(f"MAX_ITERATIONS reached after {total_time:.1f}s")
     return "Не удалось обработать запрос.", messages, None
 
 
