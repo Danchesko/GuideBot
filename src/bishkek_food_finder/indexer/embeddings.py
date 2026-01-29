@@ -16,7 +16,7 @@ from chromadb.errors import NotFoundError
 from tqdm import tqdm
 
 from bishkek_food_finder.log import setup_logging
-from bishkek_food_finder.scraper.config import CITIES, get_city_config
+from bishkek_food_finder.config import CITIES, get_city_config
 
 MODEL_NAME = "cointegrated/rubert-tiny2"
 BATCH_SIZE = 128
@@ -92,6 +92,22 @@ def delete_collection(chroma_path: str):
         return False
 
 
+def build_fts_index(conn, logger):
+    """Build FTS5 full-text search index on reviews table."""
+    logger.info("Building FTS5 index...")
+    conn.execute("DROP TABLE IF EXISTS reviews_fts")
+    conn.execute("""
+        CREATE VIRTUAL TABLE reviews_fts USING fts5(
+            text, content='reviews', content_rowid=rowid,
+            tokenize='unicode61 remove_diacritics 2'
+        )
+    """)
+    conn.execute("INSERT INTO reviews_fts(reviews_fts) VALUES('rebuild')")
+    conn.commit()
+    count = conn.execute("SELECT COUNT(*) FROM reviews_fts").fetchone()[0]
+    logger.info(f"FTS5: {count:,} reviews indexed")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build Chroma index from reviews")
     parser.add_argument(
@@ -154,7 +170,8 @@ def main():
         logger.info(f"Found {len(new_reviews):,} new reviews to index")
 
     if not new_reviews:
-        logger.info("No new reviews to index. Done!")
+        logger.info("No new reviews to index.")
+        build_fts_index(conn, logger)
         conn.close()
         return
 
@@ -169,6 +186,8 @@ def main():
     add_to_collection(collection, new_reviews, embeddings)
 
     logger.info(f"Done! Collection '{COLLECTION_NAME}' now has {collection.count():,} vectors")
+
+    build_fts_index(conn, logger)
     conn.close()
 
 

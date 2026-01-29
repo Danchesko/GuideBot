@@ -9,6 +9,7 @@ Run: uv run python -m bishkek_food_finder.search.pipeline "уютное мест
 import argparse
 import json
 import logging
+import re
 import sqlite3
 from collections import defaultdict
 from datetime import datetime
@@ -17,7 +18,7 @@ from math import radians, sin, cos, sqrt, atan2
 from sentence_transformers import SentenceTransformer
 import chromadb
 
-from bishkek_food_finder.scraper.config import CITIES, get_city_config
+from bishkek_food_finder.config import CITIES, get_city_config
 
 logger = logging.getLogger(__name__)
 
@@ -184,59 +185,114 @@ def search_chroma(
     return output
 
 
+# === FTS5 KEYWORD SEARCH ===
+
+def build_fts_query(query: str) -> str | None:
+    """Convert user query to FTS5 query with prefix matching.
+
+    Strips Russian endings for broader morphological coverage:
+    - >= 7 chars: trim 2 ("круассаны" → "круассан*")
+    - >= 5 chars: trim 1 ("бургер" → "бурге*")
+    - 3-4 chars: keep as-is ("плов" → "плов*")
+    - < 3 chars: skip (prepositions)
+    """
+    words = query.strip().split()
+    terms = []
+    for w in words:
+        w = re.sub(r'[^\w]', '', w)
+        if len(w) < 3:
+            continue
+        if len(w) >= 7:
+            stem = w[:len(w) - 2]
+        elif len(w) >= 5:
+            stem = w[:len(w) - 1]
+        else:
+            stem = w
+        terms.append(f"{stem}*")
+    return " OR ".join(terms) if terms else None
+
+
+def search_fts(
+    query: str,
+    conn,
+    n_results: int = 500,
+    restaurant_ids: set = None,
+) -> dict[str, float]:
+    """Search FTS5 for keyword matches. Returns {review_id: bm25_rank}."""
+    fts_query = build_fts_query(query)
+    if not fts_query:
+        return {}
+
+    sql = """
+        SELECT r.id, fts.rank as bm25_rank
+        FROM reviews_fts fts
+        JOIN reviews r ON r.rowid = fts.rowid
+        WHERE reviews_fts MATCH ?
+    """
+    params = [fts_query]
+
+    if restaurant_ids:
+        placeholders = ",".join("?" * len(restaurant_ids))
+        sql += f" AND r.restaurant_id IN ({placeholders})"
+        params.extend(list(restaurant_ids))
+
+    sql += " ORDER BY fts.rank LIMIT ?"
+    params.append(n_results)
+
+    rows = conn.execute(sql, params).fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
 # === SCORING ===
 
-def score_reviews(conn, chroma_results: list[dict]) -> list[dict]:
-    """Join with SQLite, compute scores."""
-    if not chroma_results:
+def score_reviews(conn, chroma_results: list[dict], bm25_by_id: dict[str, float] = None) -> list[dict]:
+    """Score reviews. Each source uses its own relevance metric."""
+    sim_by_id = {r["id"]: r["similarity"] for r in chroma_results}
+
+    fts_rel = {}
+    if bm25_by_id:
+        max_bm25 = max(abs(v) for v in bm25_by_id.values())
+        if max_bm25 > 0:
+            fts_rel = {rid: abs(rank) / max_bm25 for rid, rank in bm25_by_id.items()}
+
+    all_ids = list(set(sim_by_id) | set(fts_rel))
+    if not all_ids:
         return []
 
-    ids = [r["id"] for r in chroma_results]
-    placeholders = ",".join("?" * len(ids))
+    logger.debug(f"Scoring: {len(sim_by_id)} semantic, {len(fts_rel)} keyword")
 
+    placeholders = ",".join("?" * len(all_ids))
     rows = conn.execute(f"""
         SELECT
-            r.id,
-            r.restaurant_id,
-            r.text,
-            r.rating,
-            rest.name,
-            rest.address,
-            rest.lat,
-            rest.lon,
-            rest.rating as rating_2gis,
-            rest.reviews_count,
-            rest.category,
-            rest.cuisine,
-            rest.avg_price_som,
-            rest.schedule,
+            r.id, r.restaurant_id, r.text, r.rating,
+            rest.name, rest.address, rest.lat, rest.lon,
+            rest.rating as rating_2gis, rest.reviews_count,
+            rest.category, rest.cuisine, rest.avg_price_som, rest.schedule,
             rt.base_trust * rt.burst * rt.recency as trust,
-            rs.weighted_rating as rating_trusted,
-            rs.trusted_review_count
+            rs.weighted_rating as rating_trusted, rs.trusted_review_count
         FROM reviews r
         JOIN restaurants rest ON r.restaurant_id = rest.id
         JOIN review_trust rt ON r.id = rt.review_id
         LEFT JOIN restaurant_stats rs ON r.restaurant_id = rs.restaurant_id
         WHERE r.id IN ({placeholders})
-    """, ids).fetchall()
+    """, all_ids).fetchall()
 
     by_id = {row["id"]: dict(row) for row in rows}
-    sim_by_id = {r["id"]: r["similarity"] for r in chroma_results}
 
     scored = []
-    for review_id, similarity in sim_by_id.items():
+    for review_id in all_ids:
         review = by_id.get(review_id)
         if not review:
             continue
 
+        similarity = sim_by_id.get(review_id, fts_rel.get(review_id, 0))
         trust = review["trust"] or 0.0
         sentiment = SENTIMENT.get(review["rating"], 0.0)
-        score = (similarity ** 3) * trust * sentiment
 
         scored.append({
             **review,
             "similarity": similarity,
-            "score": score,
+            "score": similarity * trust * sentiment,
         })
 
     return scored
@@ -339,9 +395,11 @@ def search(
     open_now: bool = False,
     n_reviews: int = 500,
     top_k: int = 10,
+    keyword_only: bool = False,
+    semantic_only: bool = False,
 ) -> list[dict]:
     """Main search pipeline."""
-    logger.debug(f"Search: query='{query}', city={city}, location={location}, radius={radius_km}, price_max={price_max}")
+    logger.debug(f"Search: query='{query}', city={city}, location={location}, radius={radius_km}, price_max={price_max}, keyword_only={keyword_only}, semantic_only={semantic_only}")
 
     city_config = get_city_config(city)
     conn = sqlite3.connect(city_config['db_path'])
@@ -357,12 +415,27 @@ def search(
     )
     logger.debug(f"Filter: {len(restaurant_ids) if restaurant_ids else 'all'} restaurants")
 
-    # 2. Chroma search
-    chroma_results = search_chroma(query, city=city, n_results=n_reviews, restaurant_ids=restaurant_ids)
-    logger.debug(f"Chroma: {len(chroma_results)} results above {MIN_SIMILARITY} similarity")
+    # 2. Chroma search (skip if keyword_only)
+    if keyword_only:
+        chroma_results = []
+        logger.debug("Chroma: skipped (keyword_only)")
+    else:
+        chroma_results = search_chroma(query, city=city, n_results=n_reviews, restaurant_ids=restaurant_ids)
+        logger.debug(f"Chroma: {len(chroma_results)} results above {MIN_SIMILARITY} similarity")
 
-    # 3. Score reviews
-    scored = score_reviews(conn, chroma_results)
+    # 2b. FTS5 keyword search (skip if semantic_only)
+    if semantic_only:
+        bm25_by_id = {}
+        logger.debug("FTS5: skipped (semantic_only)")
+    else:
+        try:
+            bm25_by_id = search_fts(query, conn, n_results=n_reviews, restaurant_ids=restaurant_ids)
+        except Exception:
+            bm25_by_id = {}  # FTS5 table might not exist yet
+        logger.debug(f"FTS5: {len(bm25_by_id)} keyword matches")
+
+    # 3. Score reviews (hybrid: semantic + keyword boost)
+    scored = score_reviews(conn, chroma_results, bm25_by_id)
     logger.debug(f"Scored: {len(scored)} reviews")
 
     # 4. Aggregate by restaurant
@@ -461,14 +534,19 @@ def get_restaurant_details(
         name_variants = get_search_variants(name)
 
         if address_hint:
-            address_cap = address_hint[0].upper() + address_hint[1:] if address_hint else address_hint
-            # Build OR query for all name variants
+            # Generate address variants (original, title-cased, uppercase)
+            address_variants = [
+                address_hint,
+                address_hint.title(),  # "сухэ-батора" → "Сухэ-Батора"
+                address_hint.capitalize(),  # "сухэ-батора" → "Сухэ-батора"
+            ]
             placeholders = " OR ".join(["name LIKE ?" for _ in name_variants])
-            params = [f"%{v}%" for v in name_variants] + [f"%{address_cap}%"]
+            address_placeholders = " OR ".join(["address LIKE ?" for _ in address_variants])
+            params = [f"%{v}%" for v in name_variants] + [f"%{v}%" for v in address_variants]
             restaurants = conn.execute(f"""
                 SELECT * FROM restaurants
                 WHERE ({placeholders})
-                  AND address LIKE ?
+                  AND ({address_placeholders})
             """, params).fetchall()
         else:
             placeholders = " OR ".join(["name LIKE ?" for _ in name_variants])
@@ -617,6 +695,7 @@ def main():
     parser.add_argument("--radius", type=float, help="Search radius in km")
     parser.add_argument("--price-max", type=int, help="Max price filter")
     parser.add_argument("--open-now", action="store_true", help="Only open restaurants")
+    parser.add_argument("--keyword-only", action="store_true", help="FTS5 keyword search only (skip semantic)")
     parser.add_argument("--json", action="store_true", help="JSON output")
     args = parser.parse_args()
 
@@ -635,6 +714,7 @@ def main():
         price_max=args.price_max,
         open_now=args.open_now,
         top_k=args.top,
+        keyword_only=args.keyword_only,
     )
 
     print_results(results, json_output=args.json)

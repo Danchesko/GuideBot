@@ -14,7 +14,7 @@ import sqlite3
 import sys
 from datetime import datetime
 
-from bishkek_food_finder.scraper.config import CITIES, get_city_config
+from bishkek_food_finder.config import CITIES, get_city_config
 
 TEST_PAGES = 2
 TEST_RESTAURANTS = 10

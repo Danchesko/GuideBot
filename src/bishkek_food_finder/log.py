@@ -79,6 +79,8 @@ def setup_service_logging(
     console_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
 
     logger = logging.getLogger(f"bishkek_food_finder.{service_name}")
+    if logger.handlers:
+        return logger  # Already configured, don't add duplicate handlers
     logger.setLevel(logging.DEBUG)
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)

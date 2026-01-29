@@ -7,15 +7,16 @@ import asyncio
 import json
 import os
 import tempfile
+import time
 from functools import wraps
 
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, PicklePersistence
 
 from bishkek_food_finder.agent import run as agent_run
 from bishkek_food_finder.log import setup_service_logging
-from bishkek_food_finder.scraper.config import CITIES, get_city_config
+from bishkek_food_finder.config import CITIES, get_city_config
 
 load_dotenv()
 
@@ -23,6 +24,8 @@ load_dotenv()
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_USERS = [u.strip() for u in os.environ.get("ALLOWED_USERS", "").split(",") if u.strip()]
+HISTORY_TIMEOUT = 30 * 60  # 30 minutes — auto-reset stale sessions
+PERSISTENCE_PATH = "data/bot_persistence.pickle"
 
 # City selection keyboard
 CITY_KEYBOARD = ReplyKeyboardMarkup([
@@ -77,6 +80,64 @@ async def keep_typing(update: Update):
     while True:
         await update.message.chat.send_action("typing")
         await asyncio.sleep(5)
+
+
+async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Process a user query with the agent. Shared by message handler and pending message processing."""
+    user = context.user_data
+    city = user.get("city")
+
+    # Auto-reset stale sessions
+    now = time.time()
+    last_msg_time = user.get("last_message_time", 0)
+    if user.get("history") and (now - last_msg_time) > HISTORY_TIMEOUT:
+        user["history"] = []
+        logger.info(f"AUTO_RESET: user={update.effective_user.id} idle={now - last_msg_time:.0f}s")
+    user["last_message_time"] = now
+
+    # Build message with location context
+    if user.get("location"):
+        lat, lon = user["location"]
+        message = f"[Локация: {lat}, {lon}]\n{text}"
+    else:
+        message = text
+
+    # Build tool call notification callback
+    loop = asyncio.get_running_loop()
+
+    def on_tool_call(tool_name: str, params: dict):
+        """Send status message when agent calls a tool."""
+        if tool_name == "search_restaurants":
+            msg = f"🔍 Ищу: {params.get('query', '...')}"
+        elif tool_name == "get_restaurant":
+            name = params.get("name") or params.get("id", "...")
+            msg = f"📋 Смотрю: {name}"
+        else:
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            update.message.reply_text(msg), loop
+        )
+        future.result(timeout=5)
+
+    # Run agent with typing indicator
+    typing_task = asyncio.create_task(keep_typing(update))
+    try:
+        response, user["history"], last_results = await asyncio.to_thread(
+            agent_run, message, user.get("history", []), city,
+            on_tool_call=on_tool_call, user_id=update.effective_user.id
+        )
+        if last_results:
+            user["last_results"] = last_results
+            user["last_query"] = text
+    except Exception as e:
+        logger.error(f"ERROR: user={update.effective_user.id} error={e}")
+        await update.message.reply_text("Ошибка. Попробуй /start")
+        return
+    finally:
+        typing_task.cancel()
+
+    await send_response(update, response)
+    logger.info(f"RESPONSE: user={update.effective_user.id} city={city} len={len(response)}")
 
 
 # === HANDLERS ===
@@ -178,12 +239,21 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle location - store for geo-filtered searches."""
     loc = update.message.location
     context.user_data["location"] = (loc.latitude, loc.longitude)
-    city = context.user_data.get("city", "bishkek")
+    city = context.user_data.get("city")
+    logger.info(f"LOCATION: user={update.effective_user.id} lat={loc.latitude} lon={loc.longitude}")
+
+    if not city:
+        # Store location but ask for city first
+        await update.message.reply_text(
+            f"📍 Запомнил! Теперь выбери город:",
+            reply_markup=CITY_KEYBOARD
+        )
+        return
+
     await update.message.reply_text(
         f"📍 Запомнил! ({loc.latitude:.4f}, {loc.longitude:.4f})",
         reply_markup=get_main_keyboard(city)
     )
-    logger.info(f"LOCATION: user={update.effective_user.id} lat={loc.latitude} lon={loc.longitude}")
 
 
 @authorized
@@ -201,12 +271,23 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user["city"] = city
         user["history"] = []  # Reset history when changing city
         city_config = get_city_config(city)
-        await update.message.reply_text(
-            get_welcome_msg(city_config['name']),
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard(city)
-        )
         logger.info(f"CITY_SELECT: user={update.effective_user.id} city={city}")
+
+        # Check for pending message (user sent query before selecting city)
+        pending = user.pop("pending_message", None)
+        if pending:
+            logger.info(f"PENDING: user={update.effective_user.id} processing '{pending[:50]}...'")
+            await update.message.reply_text(
+                f"📍 {city_config['name']}",
+                reply_markup=get_main_keyboard(city)
+            )
+            await process_query(update, context, pending)
+        else:
+            await update.message.reply_text(
+                get_welcome_msg(city_config['name']),
+                parse_mode="Markdown",
+                reply_markup=get_main_keyboard(city)
+            )
         return
 
     # Handle city change button
@@ -218,41 +299,21 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if city is selected
     city = user.get("city")
     if not city:
+        # Store pending message to process after city selection
+        user["pending_message"] = text
+        logger.info(f"PENDING_STORE: user={update.effective_user.id} text='{text[:50]}...'")
         await update.message.reply_text("Сначала выбери город:", reply_markup=CITY_KEYBOARD)
         return
 
-    # Build message with location context
-    if user.get("location"):
-        lat, lon = user["location"]
-        message = f"[Локация: {lat}, {lon}]\n{text}"
-    else:
-        message = text
-
-    # Run agent with typing indicator
-    typing_task = asyncio.create_task(keep_typing(update))
-    try:
-        response, user["history"], last_results = await asyncio.to_thread(
-            agent_run, message, user.get("history", []), city
-        )
-        if last_results:
-            user["last_results"] = last_results
-            user["last_query"] = text
-    except Exception as e:
-        logger.error(f"ERROR: user={update.effective_user.id} error={e}")
-        await update.message.reply_text("Ошибка. Попробуй /start")
-        return
-    finally:
-        typing_task.cancel()
-
-    await send_response(update, response)
-    logger.info(f"RESPONSE: user={update.effective_user.id} city={city} len={len(response)}")
+    await process_query(update, context, text)
 
 
 # === MAIN ===
 
 def main():
     """Start the bot."""
-    app = Application.builder().token(BOT_TOKEN).build()
+    persistence = PicklePersistence(filepath=PERSISTENCE_PATH)
+    app = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("reset", cmd_reset))

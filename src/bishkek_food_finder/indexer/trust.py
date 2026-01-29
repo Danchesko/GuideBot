@@ -17,7 +17,7 @@ from datetime import datetime
 from collections import defaultdict
 
 from bishkek_food_finder.log import setup_logging
-from bishkek_food_finder.scraper.config import CITIES, get_city_config
+from bishkek_food_finder.config import CITIES, get_city_config
 
 # === TRUST CONFIG ===
 
