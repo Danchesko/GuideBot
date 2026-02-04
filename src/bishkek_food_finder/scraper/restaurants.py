@@ -35,51 +35,58 @@ from .config import CITIES, get_city_config
 from .db import init_database
 
 
-def extract_api_response(driver, logger):
-    """Extract restaurant data from intercepted API call.
+def extract_api_response(driver, logger, max_retries=3, retry_delay=1):
+    """Extract restaurant data from intercepted API call with retry logic.
 
     When clicking to next page, the browser makes an API call to:
     https://catalog.api.2gis.ru/3.0/items?key=...&q=еда&page=N&sort=name
 
     We intercept this call using CDP and extract the full JSON response.
+    If no response found, retries up to max_retries times with retry_delay between attempts.
 
     Returns:
         list[dict]: List of restaurants with ALL fields from API
     """
-    # Get network logs
-    logs = driver.get_log('performance')
+    for attempt in range(max_retries):
+        # Get network logs
+        logs = driver.get_log('performance')
 
-    # Find API calls to catalog.api.2gis.ru
-    for entry in logs:
-        try:
-            log = json.loads(entry['message'])['message']
+        # Find API calls to catalog.api.2gis.ru
+        for entry in logs:
+            try:
+                log = json.loads(entry['message'])['message']
 
-            # Look for Network.responseReceived events
-            if log['method'] == 'Network.responseReceived':
-                response = log['params']['response']
-                url = response.get('url', '')
+                # Look for Network.responseReceived events
+                if log['method'] == 'Network.responseReceived':
+                    response = log['params']['response']
+                    url = response.get('url', '')
 
-                # Check if this is the 2GIS catalog API
-                if 'catalog.api.2gis.ru/3.0/items' in url and response.get('status') == 200:
-                    request_id = log['params']['requestId']
+                    # Check if this is the 2GIS catalog API
+                    if 'catalog.api.2gis.ru/3.0/items' in url and response.get('status') == 200:
+                        request_id = log['params']['requestId']
 
-                    # Get response body
-                    try:
-                        body_response = driver.execute_cdp_cmd('Network.getResponseBody', {'requestId': request_id})
-                        data = json.loads(body_response['body'])
+                        # Get response body
+                        try:
+                            body_response = driver.execute_cdp_cmd('Network.getResponseBody', {'requestId': request_id})
+                            data = json.loads(body_response['body'])
 
-                        # Extract items from response
-                        if 'result' in data and 'items' in data['result']:
-                            items = data['result']['items']
-                            logger.debug(f"Intercepted API response: {len(items)} restaurants")
-                            return parse_api_items(items, logger)
-                    except Exception as e:
-                        logger.debug(f"Could not get response body for request {request_id}: {e}")
-                        continue
-        except:
-            continue
+                            # Extract items from response
+                            if 'result' in data and 'items' in data['result']:
+                                items = data['result']['items']
+                                logger.debug(f"Intercepted API response: {len(items)} restaurants")
+                                return parse_api_items(items, logger)
+                        except Exception as e:
+                            logger.debug(f"Could not get response body for request {request_id}: {e}")
+                            continue
+            except:
+                continue
 
-    logger.warning("No API response found in network logs")
+        # No response found yet, retry if attempts remaining
+        if attempt < max_retries - 1:
+            logger.debug(f"No API response yet, retrying ({attempt + 1}/{max_retries})...")
+            time.sleep(retry_delay)
+
+    logger.warning("No API response found after retries")
     return []
 
 
@@ -181,7 +188,7 @@ def click_next_page(driver, next_page_num, logger):
         driver.execute_script("arguments[0].scrollIntoView(); arguments[0].click();", next_link)
 
         # Wait for API call to happen (give it a moment)
-        time.sleep(2)
+        time.sleep(1)
 
         logger.debug(f"Clicked to page {next_page_num}")
         return True
@@ -219,6 +226,11 @@ def main():
         default=None,
         help="Number of pages to scrape (default: per-city config)"
     )
+    parser.add_argument(
+        '--search-term',
+        default='еда',
+        help="Search term (default: еда). Use 'кофе' for coffee shops."
+    )
     args = parser.parse_args()
 
     # Get city configuration
@@ -243,7 +255,7 @@ def main():
     logger.info("Launching Chrome browser (visible)...")
     options = uc.ChromeOptions()
     options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
-    driver = uc.Chrome(options=options)
+    driver = uc.Chrome(options=options, version_main=144)
 
     try:
         # Enable CDP network logging
@@ -251,8 +263,9 @@ def main():
         logger.info("Network logging enabled via CDP")
 
         # Navigate to page 1
-        logger.info("Navigating to page 1...")
-        url = city_config['search_url'].format(page=1)
+        search_term = getattr(args, 'search_term', 'еда')
+        logger.info(f"Navigating to page 1 (search term: {search_term})...")
+        url = city_config['search_url_template'].format(term=search_term, page=1)
         driver.get(url)
         time.sleep(3)  # Wait for initial page load
 

@@ -6,7 +6,6 @@ from bishkek_food_finder.config import CITIES, get_city_config  # Re-export from
 
 LOG_DIR = "logs"
 DB_PATH = "data/bishkek.db"  # Default, use get_city_config() for multi-city
-SEARCH_URL = CITIES["bishkek"]["search_url"]
 
 # 2GIS APIs
 REVIEWS_API_URL = "https://public-api.reviews.2gis.com/2.0/branches/{restaurant_id}/reviews"

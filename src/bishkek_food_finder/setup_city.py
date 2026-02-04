@@ -190,10 +190,27 @@ def main():
     for i, step in enumerate(steps, 1):
         # Build command
         if step == "restaurants":
-            cmd = ["uv", "run", "python", "-m", "bishkek_food_finder.scraper.restaurants",
-                   "--city", args.city] + test_flag
-            if args.test:
-                cmd.extend(["--pages", str(TEST_PAGES)])
+            # Run scraper for both "еда" and "кофе" search terms
+            for search_term in ["еда", "кофейня"]:
+                cmd = ["uv", "run", "python", "-m", "bishkek_food_finder.scraper.restaurants",
+                       "--city", args.city, "--search-term", search_term] + test_flag
+                if args.test:
+                    cmd.extend(["--pages", str(TEST_PAGES)])
+
+                print_step_start(i, total_steps, f"{STEP_NAMES[step]} ({search_term})", cmd)
+                success = run_cmd(cmd)
+
+                if not success:
+                    print_step_failure(build_resume_cmd(args, step))
+                    sys.exit(1)
+
+            # Show stats after both terms scraped
+            stats = get_db_stats(config['db_path'])
+            print_step_success([
+                f"Restaurants: {stats.get('restaurants', 0):,}",
+                f"Saved to: {config['db_path']}",
+            ])
+            continue  # Skip the common run logic below
 
         elif step == "reviews":
             cmd = ["uv", "run", "python", "-m", "bishkek_food_finder.scraper.reviews",
@@ -220,13 +237,7 @@ def main():
         # Show stats based on step
         stats = get_db_stats(config['db_path'])
 
-        if step == "restaurants":
-            print_step_success([
-                f"Restaurants: {stats.get('restaurants', 0):,}",
-                f"Saved to: {config['db_path']}",
-            ])
-
-        elif step == "reviews":
+        if step == "reviews":
             print_step_success([
                 f"Reviews: {stats.get('reviews', 0):,}",
                 f"Saved to: {config['db_path']}",

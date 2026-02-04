@@ -1,0 +1,8 @@
+data/
+logs/
+.venv/
+__pycache__/
+.git/
+.claude/
+docs/
+*.md

@@ -130,8 +130,15 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text
             user["last_results"] = last_results
             user["last_query"] = text
     except Exception as e:
+        error_str = str(e)
         logger.error(f"ERROR: user={update.effective_user.id} error={e}")
-        await update.message.reply_text("Ошибка. Попробуй /start")
+
+        if "tool_use_id" in error_str or "tool_result" in error_str:
+            user["history"] = []
+            logger.info(f"AUTO_RESET_ERROR: user={update.effective_user.id} history cleared")
+            await update.message.reply_text("Что-то пошло не так. Начнём заново!")
+        else:
+            await update.message.reply_text("Ошибка. Попробуй /start")
         return
     finally:
         typing_task.cancel()

@@ -97,8 +97,8 @@ def summarize_tool_result(name: str, result: dict) -> str:
 def execute_search(params: dict, city: str = "bishkek") -> dict:
     """Execute search pipeline and return compressed results.
 
-    Runs both hybrid (semantic + keyword) and keyword-only searches.
-    Returns deduplicated keyword_restaurants alongside main results.
+    Runs both semantic and keyword searches independently.
+    Restaurant can appear in both lists (with different reviews).
     """
     try:
         location = (params["latitude"], params["longitude"]) if params.get("latitude") else None
@@ -115,18 +115,14 @@ def execute_search(params: dict, city: str = "bishkek") -> dict:
         # Semantic search (Chroma only)
         results = search(**search_kwargs, semantic_only=True, n_reviews=N_REVIEWS)
 
-        # Keyword-only search (FTS5 only, skip Chroma)
+        # Keyword search (FTS5 only)
         try:
             keyword_results = search(**search_kwargs, keyword_only=True, n_reviews=N_REVIEWS)
         except Exception:
             keyword_results = []
 
-        # Deduplicate: only keep keyword restaurants NOT in hybrid results
-        hybrid_ids = {r["restaurant_id"] for r in results}
-        keyword_new = [r for r in keyword_results if r["restaurant_id"] not in hybrid_ids]
-
         compressed = compress_results(results)
-        keyword_compressed = compress_results(keyword_new)
+        keyword_compressed = compress_results(keyword_results)
 
         return {
             "count": len(compressed),

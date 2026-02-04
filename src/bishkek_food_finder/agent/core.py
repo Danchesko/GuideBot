@@ -54,6 +54,24 @@ SYSTEM_PROMPT_TEMPLATE = _prompt_path.read_text(encoding="utf-8")
 
 # === HISTORY HELPERS ===
 
+def _trim_history_window(messages: list, max_messages: int) -> list:
+    """Trim history while keeping tool_use/tool_result pairs intact."""
+    if len(messages) <= max_messages:
+        return messages
+
+    start_idx = len(messages) - max_messages
+    while start_idx < len(messages):
+        msg = messages[start_idx]
+        if (msg["role"] == "user" and
+            isinstance(msg.get("content"), list) and
+            any(isinstance(b, dict) and b.get("type") == "tool_result"
+                for b in msg["content"])):
+            start_idx += 1
+        else:
+            break
+    return messages[start_idx:]
+
+
 def _trim_tool_result(result_json: str) -> str:
     """Compact tool result for history. Strip reviews, keep identifiers."""
     try:
@@ -124,10 +142,8 @@ def run(message: str, history: list = None, city: str = "bishkek",
     messages = list(history) if history else []
 
     # Sliding window: cap history to prevent context overflow
-    if len(messages) > MAX_HISTORY_MESSAGES:
-        messages = messages[-MAX_HISTORY_MESSAGES:]
-        while messages and messages[0]["role"] != "user":
-            messages.pop(0)
+    # Uses safe trimming that keeps tool_use/tool_result pairs together
+    messages = _trim_history_window(messages, MAX_HISTORY_MESSAGES)
 
     messages.append({"role": "user", "content": message})
     logger.info(f"USER ({city}): {message}")
