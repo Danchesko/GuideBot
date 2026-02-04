@@ -2,7 +2,6 @@
 name = "bishkek-food-finder"
 version = "0.1.0"
 description = "Telegram bot for finding restaurants in Bishkek with fake review detection"
-readme = "README.md"
 requires-python = ">=3.11"
 authors = [
     { name = "Danny", email = "danberdov@gmail.com" }
@@ -20,6 +19,14 @@ dependencies = [
     "python-dotenv>=1.2.1",
     "python-telegram-bot>=22.6",
 ]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [build-system]
 requires = ["uv_build>=0.9.25,<0.10.0"]

@@ -35,24 +35,26 @@ from .config import CITIES, get_city_config
 from .db import init_database
 
 
-def extract_api_response(driver, logger, max_retries=3, retry_delay=1):
+def extract_api_response(driver, logger, max_retries=3, retry_delay=2):
     """Extract restaurant data from intercepted API call with retry logic.
 
     When clicking to next page, the browser makes an API call to:
     https://catalog.api.2gis.ru/3.0/items?key=...&q=еда&page=N&sort=name
 
     We intercept this call using CDP and extract the full JSON response.
-    If no response found, retries up to max_retries times with retry_delay between attempts.
+    Accumulates logs across retries since get_log() drains the buffer.
 
     Returns:
         list[dict]: List of restaurants with ALL fields from API
     """
+    all_logs = []
+
     for attempt in range(max_retries):
-        # Get network logs
-        logs = driver.get_log('performance')
+        # Accumulate logs (get_log drains the buffer each call)
+        all_logs.extend(driver.get_log('performance'))
 
         # Find API calls to catalog.api.2gis.ru
-        for entry in logs:
+        for entry in all_logs:
             try:
                 log = json.loads(entry['message'])['message']
 
