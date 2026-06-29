@@ -2,7 +2,6 @@
 import argparse
 import asyncio
 import logging
-import sqlite3
 from datetime import datetime
 
 import httpx
@@ -245,8 +244,6 @@ async def main_async(args, db, restaurants):
     Returns:
         dict: Aggregated stats for this run
     """
-    logger = logging.getLogger(__name__)
-
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_RESTAURANTS)
 
     # Stats tracking
@@ -296,9 +293,9 @@ def main():
         help="City to scrape reviews for (default: bishkek)"
     )
     parser.add_argument(
-        '--test',
-        action='store_true',
-        help="Use test database (data/{city}_test.db)"
+        '--db',
+        default=None,
+        help="Explicit DB path (default: data/{city}.db). Use for ad-hoc scans."
     )
     parser.add_argument(
         '--dry-run',
@@ -331,10 +328,10 @@ def main():
     args = parser.parse_args()
 
     # Get city configuration
-    city_config = get_city_config(args.city, test=args.test)
+    city_config = get_city_config(args.city, db_path=args.db)
 
     # Setup logging
-    logger = setup_logging(script_name=f"reviews_{args.city}", console_level=logging.WARNING)
+    setup_logging(script_name=f"reviews_{args.city}", console_level=logging.WARNING)
 
     # Print to console (not logged)
     print(f"\n{'='*60}")

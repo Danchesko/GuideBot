@@ -171,7 +171,14 @@ def main():
     parser.add_argument("--no-cleanup", action="store_true", help="Keep test data after run")
     args = parser.parse_args()
 
-    config = get_city_config(args.city, test=args.test)
+    if args.test:
+        config = get_city_config(
+            args.city,
+            db_path=f"data/{args.city}_test.db",
+            chroma_path=f"data/chroma_{args.city}_test",
+        )
+    else:
+        config = get_city_config(args.city)
     print_header(config['name'], args.city, args.test)
 
     start = datetime.now()
@@ -185,7 +192,7 @@ def main():
         steps = all_steps
 
     total_steps = len(steps)
-    test_flag = ["--test"] if args.test else []
+    store_flags = ["--db", config['db_path']] if args.test else []
 
     for i, step in enumerate(steps, 1):
         # Build command
@@ -193,7 +200,7 @@ def main():
             # Run scraper for both "еда" and "кофе" search terms
             for search_term in ["еда", "кофейня"]:
                 cmd = ["uv", "run", "python", "-m", "bishkek_food_finder.scraper.restaurants",
-                       "--city", args.city, "--search-term", search_term] + test_flag
+                       "--city", args.city, "--search-term", search_term] + store_flags
                 if args.test:
                     cmd.extend(["--pages", str(TEST_PAGES)])
 
@@ -214,17 +221,19 @@ def main():
 
         elif step == "reviews":
             cmd = ["uv", "run", "python", "-m", "bishkek_food_finder.scraper.reviews",
-                   "--city", args.city] + test_flag
+                   "--city", args.city] + store_flags
             if args.test:
                 cmd.extend(["--limit", str(TEST_RESTAURANTS)])
 
         elif step == "trust":
             cmd = ["uv", "run", "python", "-m", "bishkek_food_finder.indexer.trust",
-                   "--city", args.city] + test_flag
+                   "--city", args.city] + store_flags
 
         elif step == "embeddings":
             cmd = ["uv", "run", "python", "-m", "bishkek_food_finder.indexer.embeddings",
-                   "--city", args.city] + test_flag
+                   "--city", args.city] + store_flags
+            if args.test:
+                cmd += ["--chroma", config['chroma_path']]
 
         # Run
         print_step_start(i, total_steps, STEP_NAMES[step], cmd)

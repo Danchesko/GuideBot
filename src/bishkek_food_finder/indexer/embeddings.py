@@ -7,7 +7,6 @@ Run: uv run python -m bishkek_food_finder.indexer.embeddings
 """
 
 import argparse
-import logging
 import sqlite3
 
 from sentence_transformers import SentenceTransformer
@@ -117,9 +116,14 @@ def main():
         help="City to process (default: bishkek)"
     )
     parser.add_argument(
-        '--test',
-        action='store_true',
-        help="Use test paths (data/{city}_test.db, data/chroma_{city}_test)"
+        '--db',
+        default=None,
+        help="Explicit DB path (default: data/{city}.db). Use for ad-hoc scans."
+    )
+    parser.add_argument(
+        '--chroma',
+        default=None,
+        help="Explicit Chroma path (default: data/chroma_{city})."
     )
     parser.add_argument(
         '--rebuild',
@@ -134,7 +138,7 @@ def main():
     )
     args = parser.parse_args()
 
-    city_config = get_city_config(args.city, test=args.test)
+    city_config = get_city_config(args.city, db_path=args.db, chroma_path=args.chroma)
 
     logger = setup_logging(script_name=f"embeddings_{args.city}")
     logger.info(f"Processing {city_config['name']}...")

@@ -168,13 +168,13 @@ def main():
         help="City to process (default: bishkek)"
     )
     parser.add_argument(
-        '--test',
-        action='store_true',
-        help="Use test database (data/{city}_test.db)"
+        '--db',
+        default=None,
+        help="Explicit DB path (default: data/{city}.db). Use for ad-hoc scans."
     )
     args = parser.parse_args()
 
-    city_config = get_city_config(args.city, test=args.test)
+    city_config = get_city_config(args.city, db_path=args.db)
 
     logger = setup_logging(script_name=f"trust_{args.city}")
     logger.info(f"Processing {city_config['name']}...")

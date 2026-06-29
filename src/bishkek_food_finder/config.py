@@ -18,16 +18,19 @@ CITIES = {
 }
 
 
-def get_city_config(city: str, test: bool = False) -> dict:
-    """Get full configuration for a city."""
+def get_city_config(
+    city: str,
+    db_path: str | None = None,
+    chroma_path: str | None = None,
+) -> dict:
+    """Get full configuration for a city. db_path and chroma_path default
+    to data/{city}.db and data/chroma_{city} when not provided."""
     if city not in CITIES:
         raise ValueError(f"Unknown city: {city}. Available: {list(CITIES.keys())}")
-
-    suffix = "_test" if test else ""
 
     return {
         **CITIES[city],
         "city": city,
-        "db_path": f"data/{city}{suffix}.db",
-        "chroma_path": f"data/chroma_{city}{suffix}",
+        "db_path": db_path or f"data/{city}.db",
+        "chroma_path": chroma_path or f"data/chroma_{city}",
     }

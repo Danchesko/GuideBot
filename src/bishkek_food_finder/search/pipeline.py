@@ -517,9 +517,10 @@ def get_restaurant_details(
     address_hint: str = None,
     max_reviews: int = 100,
     min_trust: float = 0.3,
+    db_path: str | None = None,
 ) -> dict:
     """Look up restaurant by name, ID, or name+address."""
-    city_config = get_city_config(city)
+    city_config = get_city_config(city, db_path=db_path)
     conn = sqlite3.connect(city_config['db_path'])
     conn.row_factory = sqlite3.Row
 
