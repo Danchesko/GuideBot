@@ -24,6 +24,7 @@ import logging
 import time
 import json
 import re
+import subprocess
 from tqdm import tqdm
 
 import undetected_chromedriver as uc
@@ -33,6 +34,23 @@ from selenium.webdriver.support.ui import WebDriverWait
 from bishkek_food_finder.log import setup_logging
 from .config import CITIES, get_city_config
 from .db import init_database
+
+
+def detect_chrome_major() -> int | None:
+    """Return the installed Chrome major version, or None to let the driver auto-detect.
+
+    Keeps the chromedriver matched to whatever Chrome is installed, so a Chrome
+    auto-update never breaks the scraper.
+    """
+    chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    try:
+        out = subprocess.run(
+            [chrome, "--version"], capture_output=True, text=True, timeout=10
+        ).stdout
+        match = re.search(r"\b(\d+)\.", out)
+        return int(match.group(1)) if match else None
+    except Exception:
+        return None
 
 
 def extract_api_response(driver, logger, max_retries=3, retry_delay=2):
@@ -200,6 +218,55 @@ def click_next_page(driver, next_page_num, logger):
         return False
 
 
+def _capture_page(driver, logger, page_num, max_retries=3):
+    """Extract one page's items, retrying the API read. Returns items or None (never raises)."""
+    for attempt in range(max_retries):
+        items = extract_api_response(driver, logger)
+        if items:
+            return items
+        logger.warning(f"Page {page_num}: no API response (try {attempt + 1}/{max_retries})")
+    logger.error(f"Page {page_num}: gave up after {max_retries} tries")
+    return None
+
+
+def iter_pages(driver, logger, pages):
+    """Yield (page_num, items) for pages 2..pages+1 in order.
+
+    items is None when a page never responded, so the caller can record it without
+    losing the rest of the run. Never raises, never silently skips.
+
+    Page 1 is NOT captured: 2GIS serves it from initialState with no API call and
+    exposes no page-1 link in the pagination to click, so there is no interception
+    point. The ~12 alphabetically-first results are a known, documented gap.
+    """
+    for target in range(2, pages + 2):
+        if not click_next_page(driver, target, logger):
+            logger.info(f"Reached end of results before page {target}")
+            break
+        yield target, _capture_page(driver, logger, target)
+
+
+def save_page(items, db, dry_run, seen_ids, logger):
+    """Insert a page of restaurants with INSERT OR REPLACE; track seen ids."""
+    for r in items:
+        seen_ids.add(r['id'])
+        if dry_run:
+            logger.debug(f"  [DRY RUN] Would save: {r['name']} ({r['id']})")
+            continue
+        db.execute("""
+            INSERT OR REPLACE INTO restaurants
+            (id, name, address, lat, lon, rating, reviews_count,
+             category, cuisine, avg_price_som, schedule)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            r['id'], r['name'], r['address'], r['lat'], r['lon'],
+            r['rating'], r['reviews_count'], r['category'],
+            r['cuisine'], r['avg_price_som'], r['schedule']
+        ))
+    if not dry_run:
+        db.commit()
+
+
 def main():
     """Main scraper entry point."""
     # Parse arguments
@@ -213,9 +280,9 @@ def main():
         help="City to scrape (default: bishkek)"
     )
     parser.add_argument(
-        '--test',
-        action='store_true',
-        help="Use test database (data/{city}_test.db)"
+        '--db',
+        default=None,
+        help="Explicit DB path (default: data/{city}.db). Use for ad-hoc scans."
     )
     parser.add_argument(
         '--dry-run',
@@ -236,7 +303,7 @@ def main():
     args = parser.parse_args()
 
     # Get city configuration
-    city_config = get_city_config(args.city, test=args.test)
+    city_config = get_city_config(args.city, db_path=args.db)
 
     # Resolve pages: CLI arg overrides city config
     pages = args.pages or city_config['max_pages']
@@ -257,7 +324,8 @@ def main():
     logger.info("Launching Chrome browser (visible)...")
     options = uc.ChromeOptions()
     options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
-    driver = uc.Chrome(options=options, version_main=144)
+    driver = uc.Chrome(options=options, version_main=detect_chrome_major())
+    time.sleep(3)  # Let Chrome stabilize before sending commands
 
     try:
         # Enable CDP network logging
@@ -274,99 +342,35 @@ def main():
         # Clear logs from initial navigation
         driver.get_log('performance')
 
-        # Scrape pages sequentially
+        # Scrape pages: iter_pages yields each page's items (or None on failure),
+        # never silently skipping a page and never aborting the whole run.
         total_restaurants = 0
         all_restaurant_ids = set()
+        failed_pages = []
 
         logger.info(f"Starting sequential scrape (up to {pages} pages, stops when no more results)")
 
-        # Start from page 2 (since we need an API call, and page 1 loads via initialState)
-        actual_page = 1
-        for iteration in tqdm(range(1, pages + 1), desc="Scraping pages"):
-            try:
-                # On first iteration, click to page 2 to trigger API call
-                if iteration == 1:
-                    logger.debug("Iteration 1: Clicking to page 2 to trigger API call...")
-                    if not click_next_page(driver, 2, logger):
-                        logger.info("No page 2 - only 1 page of results")
-                        break
-                    actual_page = 2
-
-                logger.debug(f"Scraping page {actual_page}/{pages + 1}")
-
-                # Extract restaurants from API response
-                current_restaurants = extract_api_response(driver, logger)
-                logger.debug(f"Found {len(current_restaurants)} restaurants on page {actual_page}")
-
-                if not current_restaurants:
-                    logger.warning(f"Page {actual_page}: No restaurants found, skipping...")
-                    if iteration < pages:
-                        actual_page += 1
-                        if not click_next_page(driver, actual_page, logger):
-                            logger.info(f"Reached end of results at page {actual_page}")
-                            break
-                    continue
-
-                # Log first restaurant for debugging
-                if current_restaurants:
-                    r = current_restaurants[0]
-                    logger.debug(f"  First: {r['name']} ({r['id']})")
-                    logger.debug(f"    Address: {r['address']}")
-                    logger.debug(f"    Lat/Lon: {r['lat']}, {r['lon']}")
-                    logger.debug(f"    Rating: {r['rating']} ({r['reviews_count']} reviews)")
-
-                # Save to database (unless dry-run)
-                if not args.dry_run:
-                    for r in current_restaurants:
-                        # Check for duplicates
-                        if r['id'] in all_restaurant_ids:
-                            logger.debug(f"  Duplicate: {r['name']} ({r['id']}) - updating")
-                        else:
-                            all_restaurant_ids.add(r['id'])
-
-                        db.execute("""
-                            INSERT OR REPLACE INTO restaurants
-                            (id, name, address, lat, lon, rating, reviews_count,
-                             category, cuisine, avg_price_som, schedule)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            r['id'], r['name'], r['address'], r['lat'], r['lon'],
-                            r['rating'], r['reviews_count'], r['category'],
-                            r['cuisine'], r['avg_price_som'], r['schedule']
-                        ))
-
-                    db.commit()
-                    logger.debug(f"  Saved {len(current_restaurants)} restaurants to DB")
-                else:
-                    # Dry run: just log
-                    for r in current_restaurants:
-                        logger.debug(f"  [DRY RUN] Would save: {r['name']} ({r['id']})")
-                        all_restaurant_ids.add(r['id'])
-
-                total_restaurants += len(current_restaurants)
-
-                # Click to next page (if not last iteration)
-                if iteration < pages:
-                    actual_page += 1
-                    logger.debug(f"  Clicking to page {actual_page}...")
-                    if not click_next_page(driver, actual_page, logger):
-                        logger.info(f"Reached end of results at page {actual_page - 1}")
-                        break
-
-            except Exception as e:
-                logger.error(f"Page {actual_page} failed: {e}", exc_info=True)
-                # Try to continue anyway
-                if iteration < pages:
-                    actual_page += 1
-                    if not click_next_page(driver, actual_page, logger):
-                        break
+        for page_num, items in tqdm(iter_pages(driver, logger, pages), total=pages, desc="Scraping pages"):
+            if not items:
+                logger.error(f"Page {page_num}: no data captured - recorded for re-run")
+                failed_pages.append(page_num)
                 continue
+            try:
+                save_page(items, db, args.dry_run, all_restaurant_ids, logger)
+                total_restaurants += len(items)
+            except Exception as e:
+                logger.error(f"Page {page_num}: save failed: {e}", exc_info=True)
+                failed_pages.append(page_num)
 
         # Summary
         logger.info("=" * 80)
-        logger.info(f"Scraping complete!")
+        logger.info("Scraping complete!")
         logger.info(f"  Total restaurants scraped: {total_restaurants}")
         logger.info(f"  Unique restaurants: {len(all_restaurant_ids)}")
+        if failed_pages:
+            logger.error(f"  {len(failed_pages)} pages had no data: {sorted(failed_pages)}")
+            print(f"⚠ {len(failed_pages)} страниц без данных: {sorted(failed_pages)} — перезапусти для добора")
+        logger.info("  Note: page 1 (~12 first results) not captured — known 2GIS limitation")
 
         if args.dry_run:
             logger.info("  DRY RUN - No data was saved to database")
