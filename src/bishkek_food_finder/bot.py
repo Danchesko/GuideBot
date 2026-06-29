@@ -270,20 +270,21 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user = context.user_data
     text = update.message.text
-    logger.info(f"MESSAGE: user={update.effective_user.id} text={text[:50]}...")
+    logger.info(f"MESSAGE: user={update.effective_user.id} text={text}")
 
     # Handle city selection buttons
     if text in CITY_BUTTON_MAP:
         city = CITY_BUTTON_MAP[text]
         user["city"] = city
         user["history"] = []  # Reset history when changing city
+        user.pop("location", None)  # Clear stale location from previous city
         city_config = get_city_config(city)
         logger.info(f"CITY_SELECT: user={update.effective_user.id} city={city}")
 
         # Check for pending message (user sent query before selecting city)
         pending = user.pop("pending_message", None)
         if pending:
-            logger.info(f"PENDING: user={update.effective_user.id} processing '{pending[:50]}...'")
+            logger.info(f"PENDING: user={update.effective_user.id} processing '{pending}'")
             await update.message.reply_text(
                 f"📍 {city_config['name']}",
                 reply_markup=get_main_keyboard(city)
@@ -308,7 +309,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not city:
         # Store pending message to process after city selection
         user["pending_message"] = text
-        logger.info(f"PENDING_STORE: user={update.effective_user.id} text='{text[:50]}...'")
+        logger.info(f"PENDING_STORE: user={update.effective_user.id} text='{text}'")
         await update.message.reply_text("Сначала выбери город:", reply_markup=CITY_KEYBOARD)
         return
 

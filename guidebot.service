@@ -1,0 +1,15 @@
+[Unit]
+Description=GuideBot Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/dev/GuideBot
+ExecStart=/home/ubuntu/dev/GuideBot/.venv/bin/python -m bishkek_food_finder.bot
+Restart=always
+RestartSec=5
+EnvironmentFile=/home/ubuntu/dev/GuideBot/.env
+
+[Install]
+WantedBy=multi-user.target
