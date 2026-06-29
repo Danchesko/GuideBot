@@ -233,6 +233,11 @@ def main():
         default='еда',
         help="Search term (default: еда). Use 'кофе' for coffee shops."
     )
+    parser.add_argument(
+        '--headless',
+        action='store_true',
+        help="Run Chrome in headless mode (for servers without display)"
+    )
     args = parser.parse_args()
 
     # Get city configuration
@@ -254,10 +259,16 @@ def main():
         logger.info("DRY RUN MODE - No database writes")
 
     # Launch Chrome with performance logging enabled
-    logger.info("Launching Chrome browser (visible)...")
     options = uc.ChromeOptions()
     options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
-    driver = uc.Chrome(options=options, version_main=144)
+    options.add_argument('--window-size=1920,1080')
+    options.add_argument('--disable-blink-features=AutomationControlled')
+    if args.headless:
+        options.add_argument('--headless=new')
+        logger.info("Launching Chrome browser (headless)...")
+    else:
+        logger.info("Launching Chrome browser (visible)...")
+    driver = uc.Chrome(options=options, version_main=146)
 
     try:
         # Enable CDP network logging
@@ -269,7 +280,7 @@ def main():
         logger.info(f"Navigating to page 1 (search term: {search_term})...")
         url = city_config['search_url_template'].format(term=search_term, page=1)
         driver.get(url)
-        time.sleep(3)  # Wait for initial page load
+        time.sleep(7)  # Wait for initial page load (longer for headless)
 
         # Clear logs from initial navigation
         driver.get_log('performance')
