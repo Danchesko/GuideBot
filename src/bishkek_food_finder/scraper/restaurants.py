@@ -40,17 +40,24 @@ def detect_chrome_major() -> int | None:
     """Return the installed Chrome major version, or None to let the driver auto-detect.
 
     Keeps the chromedriver matched to whatever Chrome is installed, so a Chrome
-    auto-update never breaks the scraper.
+    auto-update never breaks the scraper. Checks macOS and Linux locations.
     """
-    chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-    try:
-        out = subprocess.run(
-            [chrome, "--version"], capture_output=True, text=True, timeout=10
-        ).stdout
+    candidates = (
+        ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "--version"],  # macOS
+        ["google-chrome", "--version"],          # Linux (server runs this)
+        ["google-chrome-stable", "--version"],
+        ["chromium-browser", "--version"],
+        ["chromium", "--version"],
+    )
+    for cmd in candidates:
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout
+        except Exception:
+            continue
         match = re.search(r"\b(\d+)\.", out)
-        return int(match.group(1)) if match else None
-    except Exception:
-        return None
+        if match:
+            return int(match.group(1))
+    return None
 
 
 def extract_api_response(driver, logger, max_retries=3, retry_delay=2):
