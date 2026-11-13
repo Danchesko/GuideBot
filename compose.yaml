@@ -1,0 +1,54 @@
+name: ${COMPOSE_PROJECT_NAME:-guidebot}
+
+x-common: &common
+  init: true
+  user: "${APP_UID:-10001}:${APP_GID:-10001}"
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  volumes:
+    - ${DATA_DIR:-./data}:/app/data
+    - ${LOGS_DIR:-./logs}:/app/logs
+    - ${CACHE_DIR:-./cache}:/app/cache
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  bot:
+    <<: *common
+    image: guidebot-bot:local
+    build:
+      context: .
+      target: bot
+    restart: unless-stopped
+    stop_grace_period: 60s
+    mem_limit: 5g
+    cpus: 2
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      ALLOWED_USERS: ${ALLOWED_USERS:-}
+    healthcheck:
+      test: [CMD, python, -c, "import time, pathlib; p = pathlib.Path('/tmp/guidebot-poll.ok'); raise SystemExit(not (p.exists() and time.time() - p.stat().st_mtime < 120))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 90s
+      retries: 3
+
+  collector:
+    <<: *common
+    image: guidebot-collector:local
+    build:
+      context: .
+      target: collector
+    profiles: [maintenance]
+    restart: "no"
+    shm_size: 1gb
+    mem_limit: 5g
+    cpus: 2
+    environment:
+      REVIEWS_API_KEY: ${REVIEWS_API_KEY:-}
+    entrypoint: [bash, /app/scripts/collect-city.sh]
+    command: [--help]

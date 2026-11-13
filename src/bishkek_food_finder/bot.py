@@ -9,10 +9,11 @@ import os
 import tempfile
 import time
 from functools import wraps
+from pathlib import Path
 
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, PicklePersistence
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, PicklePersistence, ExtBot
 
 from bishkek_food_finder.agent import run as agent_run
 from bishkek_food_finder.log import setup_service_logging
@@ -316,12 +317,24 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_query(update, context, text)
 
 
+# A successful poll proves that the process can reach Telegram with this token.
+HEALTH_FILE = Path("/tmp/guidebot-poll.ok")
+
+
+class PollingBot(ExtBot):
+    async def get_updates(self, *args, **kwargs):
+        updates = await super().get_updates(*args, **kwargs)
+        HEALTH_FILE.touch()
+        return updates
+
+
 # === MAIN ===
 
 def main():
     """Start the bot."""
+    HEALTH_FILE.unlink(missing_ok=True)
     persistence = PicklePersistence(filepath=PERSISTENCE_PATH)
-    app = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
+    app = Application.builder().bot(PollingBot(BOT_TOKEN)).persistence(persistence).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("reset", cmd_reset))

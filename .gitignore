@@ -1,6 +1,7 @@
 # Secrets
 .env
 .env.*
+!.env.example
 
 .claude/
 ai-context/
@@ -20,8 +21,7 @@ env/
 .uv/
 
 # Data (large files)
-data/
-docs/
+/data
 
 # IDE
 .vscode/
@@ -32,4 +32,14 @@ docs/
 .DS_Store
 Thumbs.db
 # Logs
-logs/
+/logs
+*.log
+
+# Local deployment state
+/cache
+/backups
+/.manage.lock
+CLAUDE.local.md
+
+# Previous data retained by restore
+/data.before-restore-*

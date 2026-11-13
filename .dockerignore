@@ -4,5 +4,17 @@ logs/
 __pycache__/
 .git/
 .claude/
+ai-context/
 docs/
 *.md
+.env
+.env.*
+*.log
+/debug_screenshot.png
+tests/
+cache/
+backups/
+.manage.lock
+
+# Previous data retained by restore
+/data.before-restore-*
