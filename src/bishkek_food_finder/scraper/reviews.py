@@ -326,6 +326,8 @@ def main():
         help="Fetch and show stats without saving to database"
     )
     args = parser.parse_args()
+    if not REVIEWS_API_KEY:
+        parser.error("Set REVIEWS_API_KEY in the environment or .env before collecting reviews")
 
     # Get city configuration
     city_config = get_city_config(args.city, db_path=args.db)

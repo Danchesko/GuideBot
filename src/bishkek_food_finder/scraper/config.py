@@ -1,6 +1,12 @@
 """Configuration for the scraper."""
 
+import os
+
+from dotenv import load_dotenv
+
 from bishkek_food_finder.config import CITIES, get_city_config  # Re-export from root config
+
+load_dotenv()
 
 # === LEGACY DEFAULTS (for backward compatibility) ===
 
@@ -9,7 +15,7 @@ DB_PATH = "data/bishkek.db"  # Default, use get_city_config() for multi-city
 
 # 2GIS APIs
 REVIEWS_API_URL = "https://public-api.reviews.2gis.com/2.0/branches/{restaurant_id}/reviews"
-REVIEWS_API_KEY = "6e7e1929-4ea9-4a5d-8c05-d601860389bd"
+REVIEWS_API_KEY = os.environ.get("REVIEWS_API_KEY", "")
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
 # Rate limiting
