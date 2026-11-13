@@ -8,6 +8,7 @@ Run: uv run python -m bishkek_food_finder.indexer.embeddings
 
 import argparse
 import sqlite3
+from contextlib import closing
 
 from sentence_transformers import SentenceTransformer
 import chromadb
@@ -23,16 +24,22 @@ COLLECTION_NAME = "reviews"  # Will be used as-is (one collection per city chrom
 MIN_TRUST_DEFAULT = 0.3
 
 
-def load_reviews(conn, min_trust: float = MIN_TRUST_DEFAULT) -> list[dict]:
-    """Load reviews with trust score >= min_trust from SQLite."""
-    rows = conn.execute("""
+def iter_review_batches(conn, min_trust=MIN_TRUST_DEFAULT, batch_size=BATCH_SIZE):
+    """Read eligible reviews without loading the whole database into memory."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    cursor = conn.execute("""
         SELECT r.id, r.restaurant_id, r.text
         FROM reviews r
         JOIN review_trust rt ON r.id = rt.review_id
         WHERE r.text IS NOT NULL AND r.text != ''
           AND (rt.base_trust * rt.burst * rt.recency) >= ?
-    """, (min_trust,)).fetchall()
-    return [dict(r) for r in rows]
+    """, (min_trust,))
+    try:
+        while rows := cursor.fetchmany(batch_size):
+            yield [dict(row) for row in rows]
+    finally:
+        cursor.close()
 
 
 def get_or_create_collection(chroma_path: str):
@@ -51,34 +58,34 @@ def get_or_create_collection(chroma_path: str):
         return collection, True
 
 
-def get_existing_ids(collection) -> set[str]:
-    """Get all review IDs already in Chroma."""
-    result = collection.get(include=[])
-    return set(result['ids'])
+def index_reviews(
+    conn, collection, min_trust=MIN_TRUST_DEFAULT, batch_size=BATCH_SIZE,
+    model_factory=SentenceTransformer,
+):
+    """Embed and save missing reviews one batch at a time."""
+    model = None
+    indexed = 0
+    with closing(iter_review_batches(conn, min_trust, batch_size)) as batches:
+        for reviews in tqdm(batches, desc="Indexing", unit="batch"):
+            existing = set(collection.get(
+                ids=[review['id'] for review in reviews], include=[],
+            )['ids'])
+            new_reviews = [review for review in reviews if review['id'] not in existing]
+            if not new_reviews:
+                continue
 
-
-def embed_texts(model, texts: list[str], batch_size: int = BATCH_SIZE) -> list[list[float]]:
-    """Embed texts in batches, returns list of vectors."""
-    embeddings = []
-    for i in tqdm(range(0, len(texts), batch_size), desc="Embedding"):
-        batch = texts[i:i + batch_size]
-        batch_embeddings = model.encode(batch, show_progress_bar=False)
-        embeddings.extend(batch_embeddings.tolist())
-    return embeddings
-
-
-def add_to_collection(collection, reviews: list[dict], embeddings: list[list[float]]):
-    """Add reviews with embeddings to Chroma collection."""
-    batch_size = 5000
-    for i in tqdm(range(0, len(reviews), batch_size), desc="Indexing"):
-        batch_reviews = reviews[i:i + batch_size]
-        batch_embeddings = embeddings[i:i + batch_size]
-
-        collection.add(
-            ids=[r['id'] for r in batch_reviews],
-            embeddings=batch_embeddings,
-            metadatas=[{"restaurant_id": r['restaurant_id']} for r in batch_reviews],
-        )
+            if model is None:
+                model = model_factory(MODEL_NAME)
+            embeddings = model.encode(
+                [review['text'] for review in new_reviews], show_progress_bar=False,
+            ).tolist()
+            collection.add(
+                ids=[review['id'] for review in new_reviews],
+                embeddings=embeddings,
+                metadatas=[{'restaurant_id': review['restaurant_id']} for review in new_reviews],
+            )
+            indexed += len(new_reviews)
+    return indexed
 
 
 def delete_collection(chroma_path: str):
@@ -149,50 +156,17 @@ def main():
     conn = sqlite3.connect(city_config['db_path'])
     conn.row_factory = sqlite3.Row
 
-    logger.info(f"Loading reviews with trust >= {args.min_trust}...")
-    reviews = load_reviews(conn, min_trust=args.min_trust)
-    logger.info(f"Loaded {len(reviews):,} trusted reviews")
+    try:
+        if args.rebuild:
+            logger.info("Deleting existing collection...")
+            delete_collection(city_config['chroma_path'])
 
-    # Handle rebuild
-    if args.rebuild:
-        logger.info("Deleting existing collection...")
-        if delete_collection(city_config['chroma_path']):
-            logger.info("Deleted existing collection")
-        else:
-            logger.info("No existing collection to delete")
-
-    logger.info(f"Checking Chroma collection at {city_config['chroma_path']}...")
-    collection, is_new = get_or_create_collection(city_config['chroma_path'])
-
-    if is_new:
-        logger.info("Creating new collection")
-        new_reviews = reviews
-    else:
-        logger.info(f"Found existing collection with {collection.count():,} vectors")
-        existing_ids = get_existing_ids(collection)
-        new_reviews = [r for r in reviews if r['id'] not in existing_ids]
-        logger.info(f"Found {len(new_reviews):,} new reviews to index")
-
-    if not new_reviews:
-        logger.info("No new reviews to index.")
+        collection, _ = get_or_create_collection(city_config['chroma_path'])
+        indexed = index_reviews(conn, collection, min_trust=args.min_trust)
+        logger.info(f"Added {indexed:,} reviews; collection has {collection.count():,} vectors")
         build_fts_index(conn, logger)
+    finally:
         conn.close()
-        return
-
-    logger.info(f"Loading model: {MODEL_NAME}")
-    model = SentenceTransformer(MODEL_NAME)
-
-    logger.info(f"Embedding {len(new_reviews):,} reviews (batch_size={BATCH_SIZE})...")
-    texts = [r['text'] for r in new_reviews]
-    embeddings = embed_texts(model, texts)
-
-    logger.info("Adding to Chroma...")
-    add_to_collection(collection, new_reviews, embeddings)
-
-    logger.info(f"Done! Collection '{COLLECTION_NAME}' now has {collection.count():,} vectors")
-
-    build_fts_index(conn, logger)
-    conn.close()
 
 
 if __name__ == "__main__":
